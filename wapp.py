@@ -5,6 +5,7 @@ import shutil
 import requests
 import socket
 import ssl
+import re
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="EdgeSight SE", layout="wide")
@@ -18,39 +19,44 @@ def boot():
 
 CLIENT, MODEL_ID = boot()
 
-# --- MOTOR TÉCNICO ---
+# --- MOTOR DE RECONOCIMIENTO ---
 def get_infra_data(domain):
-    data = {"ip": "N/A", "owner": "N/A", "ssl_exp": "N/A", "ports": [], "dnssec": False}
-    # IP & Owner
+    data = {"ip": "N/A", "owner": "N/A", "ssl_cn": "N/A", "ssl_exp": "N/A", "ports": []}
+    
+    # 1. IP Pública (Múltiples fallbacks)
     try:
+        # Intento con dig (instalar dnsutils si falla)
         res_ip = subprocess.run(["dig", "+short", domain], capture_output=True, text=True, timeout=5)
-        data["ip"] = res_ip.stdout.splitlines()[0] if res_ip.stdout else socket.gethostbyname(domain)
+        ip_list = [line for line in res_ip.stdout.splitlines() if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", line)]
+        if ip_list:
+            data["ip"] = ip_list[0]
+        else:
+            data["ip"] = socket.gethostbyname(domain)
+        
+        # 2. Owner vía WHOIS
         res_w = subprocess.run(["whois", data["ip"]], capture_output=True, text=True, timeout=5)
         for line in res_w.stdout.splitlines():
-            if any(x in line.lower() for x in ["org-name", "descr", "organization"]):
-                data["owner"] = line.split(":", 1)[1].strip(); break
+            if any(x in line.lower() for x in ["org-name", "descr", "organization", "netname"]):
+                data["owner"] = line.split(":", 1)[1].strip()
+                break
     except: pass
 
-    # DNSSEC Check
+    # 3. Certificado (OpenSSL style nativo)
     try:
-        res_ds = subprocess.run(["dig", "+short", "DS", domain], capture_output=True, text=True, timeout=3)
-        data["dnssec"] = True if res_ds.stdout.strip() else False
+        ctx = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=4) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert()
+                subject = dict(x[0] for x in cert['subject'])
+                data["ssl_cn"] = subject.get('commonName', 'N/A')
+                data["ssl_exp"] = cert.get('notAfter', 'N/A')
     except: pass
 
-    # Puertos Críticos
+    # 4. Puertos
     for p in [80, 443, 8080, 8443, 2083]:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.4)
             if s.connect_ex((domain, p)) == 0: data["ports"].append(p)
-
-    # Certificado
-    try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((domain, 443), timeout=3) as sock:
-            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert = ssock.getpeercert()
-                data["ssl_exp"] = cert.get('notAfter', 'N/A')
-    except: pass
     
     return data
 
@@ -62,11 +68,11 @@ if st.button("🚀 Iniciar Auditoría"):
     if target:
         dom = target.replace("https://", "").replace("http://", "").split('/')[0]
         
-        with st.status("Analizando...", expanded=False) as status:
+        with st.status("Ejecutando...", expanded=False) as status:
             infra = get_infra_data(dom)
-            waf = subprocess.run(["wafw00f", dom], capture_output=True, text=True).stdout or ""
-            what = subprocess.run(["whatweb", dom], capture_output=True, text=True).stdout or ""
+            waf_raw = subprocess.run(["wafw00f", dom], capture_output=True, text=True).stdout or ""
             
+            # Análisis de cabeceras
             try:
                 r = requests.get(f"https://{dom}", timeout=5, verify=False)
                 srv = r.headers.get("Server", "Desconocido")
@@ -74,27 +80,39 @@ if st.button("🚀 Iniciar Auditoría"):
                 h_ok = all(x in r.headers for x in ["Strict-Transport-Security", "Content-Security-Policy"])
             except: srv, cdn, h_ok = "N/A", "N/A", False
 
-            prompt = f"Dom: {dom}, IP: {infra['ip']} ({infra['owner']}), Ports: {infra['ports']}, DNSSEC: {infra['dnssec']}, WAF: {waf[:150]}, Srv: {srv}, CDN: {cdn}, SecHeaders: {h_ok}. Output: 5 bullets secos, anomalías y valor Akamai."
+            # Prompt imperativo para brevedad extrema
+            prompt = f"Dom: {dom}, IP: {infra['ip']}, CN: {infra['ssl_cn']}, Exp: {infra['ssl_exp']}, Ports: {infra['ports']}, WAF: {waf_raw[:150]}, Srv: {srv}, CDN: {cdn}, SecHeaders: {h_ok}. Analiza anomalías técnicas para venta Akamai en 5 puntos secos."
             res = CLIENT.models.generate_content(model=MODEL_ID, contents=prompt)
             status.update(label="Análisis Finalizado", state="complete")
 
-        # Dashboard Minimalista
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("IP Pública", infra['ip'], infra['owner'][:20])
-        c2.metric("DNSSEC", "Activo" if infra['dnssec'] else "Inexistente")
-        c3.metric("Security Headers", "✅ OK" if h_ok else "❌ Missing")
-        c4.metric("Puertos", len(infra['ports']))
+        # --- Dashboard de Métricas (Principal) ---
+        c1, c2, c3 = st.columns(3)
+        c1.metric("IP Pública", infra['ip'], infra['owner'][:25])
+        c2.metric("Certificado (CN)", infra['ssl_cn'][:30])
+        c3.metric("Vencimiento SSL", infra['ssl_exp'][:15])
+
+        c1b, c2b, c3b = st.columns(3)
+        c1b.metric("Web Server", srv[:20])
+        c2b.metric("CDN / WAF", "Detectado" if "is behind" in waf_raw or cdn != "N/A" else "None")
+        c3b.metric("Security Headers", "✅ OK" if h_ok else "❌ Missing")
 
         st.divider()
 
-        # Resumen Técnico
-        col_a, col_b = st.columns([2, 1])
-        with col_a:
+        # --- Pestañas para ocultar detalle ---
+        tab_brief, tab_tech = st.tabs(["⚡ Briefing Estratégico", "🛠️ Detalle Técnico (Oculto)"])
+        
+        with tab_brief:
             st.info(res.text)
-        with col_b:
+            
+        with tab_tech:
             st.code(f"""
-SERVER: {srv}
-CDN/WAF: {cdn}
-PORTS: {infra['ports']}
-SSL EXP: {infra['ssl_exp'][:15]}
+IP: {infra['ip']}
+OWNER: {infra['owner']}
+COMMON NAME: {infra['ssl_cn']}
+EXPIRATION: {infra['ssl_exp']}
+PORTS OPEN: {infra['ports']}
+SERVER HEADER: {srv}
+CDN/WAF HEADER: {cdn}
             """)
+            st.write("**Salida Cruta de Herramientas:**")
+            st.text(waf_raw[:1000])
