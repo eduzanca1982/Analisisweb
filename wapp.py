@@ -5,145 +5,138 @@ import shutil
 import requests
 from fpdf import FPDF
 import os
+import time
 
-# --- CONFIGURACIÓN DE PÁGINA ---
+# --- 1. CONFIGURACIÓN Y ARRANQUE SEGURO ---
 st.set_page_config(page_title="EdgeSight | Akamai Sales Intel", layout="wide", page_icon="🛡️")
 
-# Estilo corporativo para el equipo de ventas
-st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #005595; color: white; font-weight: bold; }
-    .stDownloadButton>button { background-color: #28a745; color: white; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- CONFIGURACIÓN DEL MODELO (Basado en tus capturas) ---
-try:
-    # Obtiene la clave de Secrets de Streamlit
-    api_key = st.secrets["GEMINI_API_KEY"]
-    client = genai.Client(api_key=api_key)
-    # Usamos el ID exacto confirmado en tu Google AI Studio
-    MODEL_ID = "gemini-2.0-flash" 
-except Exception as e:
-    st.error(f"Error de configuración (Secrets/API): {e}")
-    st.stop()
-
-# --- FUNCIONES TÉCNICAS ---
-def run_command(cmd_list):
-    """Ejecuta herramientas de CLI instaladas en el servidor."""
-    if not shutil.which(cmd_list[0]):
-        return f"Error: La herramienta {cmd_list[0]} no está instalada."
+@st.cache_resource
+def boot_gemini():
+    """Inicializa el cliente y detecta modelos para evitar errores de conexión repetitivos."""
     try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        client = genai.Client(api_key=api_key)
+        # Intentamos detectar si el modelo flash está disponible
+        modelos = [m.name for m in client.models.list() if 'generateContent' in m.supported_methods]
+        # Priorizamos gemini-2.0-flash como vimos en tus capturas
+        target_model = next((m for m in modelos if "gemini-2.0-flash" in m), "gemini-1.5-flash")
+        return client, target_model
+    except Exception as e:
+        st.error(f"Error crítico de inicialización: {e}")
+        return None, None
+
+CLIENT, MODEL_ID = boot_gemini()
+
+# --- 2. FUNCIONES TÉCNICAS ---
+def run_command(cmd_list):
+    if not shutil.which(cmd_list[0]):
+        return f"Error: {cmd_list[0]} no instalado."
+    try:
+        # Timeout para evitar que procesos colgados consuman recursos
         result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=60)
         return f"{result.stdout}\n{result.stderr}"
     except Exception as e:
         return f"Error en ejecución: {str(e)}"
 
 def get_http_intel(url):
-    """Analiza headers de seguridad básicos."""
     try:
         if not url.startswith('http'): url = 'https://' + url
-        # Desactivamos verify para evitar bloqueos por certificados mal configurados en prospectos
         res = requests.get(url, timeout=10, verify=False)
         h = res.headers
         return {
-            "Server": h.get("Server", "No expuesto"),
-            "Cache-Control": h.get("Cache-Control", "N/A"),
+            "Server": h.get("Server", "Oculto"),
+            "CDN-Header": h.get("X-Cache", h.get("CF-Cache-Status", "N/A")),
             "HSTS": "Strict-Transport-Security" in h,
             "CSP": "Content-Security-Policy" in h
         }
     except:
-        return {"Error": "No se pudo conectar al host"}
+        return {"Error": "Conexión fallida"}
 
-# --- INTERFAZ PRINCIPAL ---
+# --- 3. INTERFAZ ---
 st.title("🛡️ EdgeSight: Akamai Intelligence Tool")
-st.markdown("### Soporte de Preventa para Account Executives y SEs")
 
-target = st.text_input("Ingresa el dominio del prospecto:", placeholder="ejemplo.com")
+if not CLIENT:
+    st.warning("⚠️ Configura la GEMINI_API_KEY en Secrets para continuar.")
+    st.stop()
 
-if st.button("🚀 Iniciar Auditoría Técnica"):
+target = st.text_input("Dominio del Prospecto (ej: empresa.com):", placeholder="dominio.com")
+
+if st.button("🚀 Iniciar Auditoría de Venta"):
     if target:
-        # Limpieza de entrada
         clean_target = target.replace("https://", "").replace("http://", "").split('/')[0]
         
-        with st.status("🔍 Escaneando infraestructura...", expanded=True) as status:
+        with st.status("🔍 Procesando auditoría...", expanded=True) as status:
+            # Reconocimiento pasivo
             st.write("🛰️ Ejecutando wafw00f...")
             waf_info = run_command(["wafw00f", clean_target])
             
             st.write("🔎 Ejecutando WhatWeb...")
             whatweb_info = run_command(["whatweb", "--aggression", "1", clean_target])
             
-            st.write("🌐 Analizando HTTP Headers...")
+            st.write("🌐 Verificando Headers...")
             headers_intel = get_http_intel(clean_target)
             
-            st.write(f"🧠 Generando estrategia con {MODEL_ID}...")
+            st.write(f"🧠 Consultando IA ({MODEL_ID})...")
             
-            # Prompt estratégico para ventas de Akamai
-            prompt = f"""
-            Actúa como un Senior Solution Engineer de Akamai Technologies.
-            Analiza los datos técnicos del sitio: {clean_target}
-            
-            LOGS TÉCNICOS:
-            - WAF Detection: {waf_info}
-            - WhatWeb Footprint: {whatweb_info}
-            - Security Headers: {headers_intel}
-            
-            Tu objetivo es crear un Briefing de Ventas que incluya:
-            1. Infraestructura Actual: ¿Qué CDN/WAF usan hoy?
-            2. Brechas y Oportunidades: Si no tienen WAF o usan competencia (Cloudflare, AWS), ¿por qué Akamai es mejor?
-            3. Propuesta de Valor: Menciona productos específicos (App & API Protector, Ion, Bot Manager).
-            4. Pitch Sugerido: Una frase de apertura para el Account Executive.
-            """
-            
+            # Defensa contra 429 y generación de contenido
             try:
-                response = client.models.generate_content(model=MODEL_ID, contents=prompt)
+                prompt = f"""
+                Actúa como Senior SE de Akamai. Analiza {clean_target}:
+                Logs: {waf_info} | {whatweb_info}
+                Headers: {headers_intel}
+                Genera un Briefing de Ventas con: Stack actual, Brechas de seguridad y Pitch para Akamai App & API Protector.
+                """
+                
+                # Intentar llamada a la API
+                response = CLIENT.models.generate_content(model=MODEL_ID, contents=prompt)
                 report_text = response.text
                 status.update(label="Análisis Finalizado", state="complete")
+                
             except Exception as e:
-                st.error(f"Error con la API de Gemini: {e}")
-                report_text = "No se pudo generar el reporte."
+                if "429" in str(e):
+                    st.error("🚫 Cuota excedida (Error 429). Por favor, espera un minuto antes de intentar de nuevo.")
+                else:
+                    st.error(f"Error con la API: {e}")
+                report_text = f"Error al generar reporte: {e}"
 
         # --- TABS DE RESULTADOS ---
-        t_sales, t_tech, t_pdf = st.tabs(["📊 Estrategia de Venta", "🔧 Datos Crudos", "📥 Reporte PDF"])
+        t_sales, t_tech, t_pdf = st.tabs(["📊 Estrategia de Venta", "🔧 Datos Técnicos", "📥 Exportar"])
         
         with t_sales:
             st.markdown(report_text)
             
         with t_tech:
-            st.write("**Headers de Seguridad:**")
+            st.write("**Seguridad detectada:**")
             st.json(headers_intel)
-            with st.expander("Ver Logs de Herramientas"):
-                st.subheader("WhatWeb")
-                st.code(whatweb_info)
-                st.subheader("WAFw00f")
-                st.code(waf_info)
+            with st.expander("Ver Logs Crudos"):
+                st.code(f"--- WHATWEB ---\n{whatweb_info}\n\n--- WAFW00F ---\n{waf_info}")
 
         with t_pdf:
-            st.info("Genera un documento PDF para enviar al cliente o al equipo interno.")
-            
-            # Generación de PDF con fpdf2
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Helvetica", size=12)
-            pdf.cell(200, 10, txt=f"Akamai Sales Intel: {clean_target}", ln=1, align='C')
-            pdf.ln(10)
-            
-            # Limpiar texto para evitar errores de codificación
-            clean_pdf_text = report_text.encode('latin-1', 'replace').decode('latin-1')
-            pdf.multi_cell(0, 10, txt=clean_pdf_text)
-            
-            # Convertir a bytes para el botón de Streamlit
-            pdf_output = pdf.output()
-            
-            st.download_button(
-                label="📥 Descargar PDF para AE",
-                data=pdf_output,
-                file_name=f"Akamai_Report_{clean_target}.pdf",
-                mime="application/pdf"
-            )
-    else:
-        st.error("Por favor, ingresa un dominio válido.")
+            st.info("Generar reporte oficial.")
+            try:
+                pdf = FPDF()
+                pdf.add_page()
+                pdf.set_font("Arial", size=12)
+                pdf.cell(200, 10, txt=f"Akamai Sales Intelligence - {clean_target}", ln=1, align='C')
+                pdf.ln(10)
+                
+                # Sanitización para evitar errores de codificación
+                pdf_body = report_text.encode('latin-1', 'replace').decode('latin-1')
+                pdf.multi_cell(0, 10, txt=pdf_body)
+                
+                # FIX CRÍTICO: Convertir output a bytes explícitamente
+                pdf_bytes = bytes(pdf.output())
+                
+                st.download_button(
+                    label="📥 Descargar Reporte PDF",
+                    data=pdf_bytes,
+                    file_name=f"Akamai_Report_{clean_target}.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as pdf_err:
+                st.error(f"Error generando PDF: {pdf_err}")
 
-st.sidebar.markdown("---")
-st.sidebar.caption("Herramienta interna basada en escaneos pasivos.")
+    else:
+        st.error("Ingresa un dominio válido.")
+
+st.sidebar.caption(f"Modelo activo: {MODEL_ID}")
