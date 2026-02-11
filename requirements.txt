@@ -2,3 +2,5 @@ streamlit
 google-generativeai
 pandas
 w00fwaf
+fpdf
+requests
