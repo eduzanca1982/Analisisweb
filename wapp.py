@@ -8,7 +8,7 @@ import ssl
 import re
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="EdgeSight SE", layout="wide")
+st.set_page_config(page_title="NinjaZight SE", layout="wide")
 
 @st.cache_resource
 def boot():
@@ -22,41 +22,46 @@ CLIENT, MODEL_ID = boot()
 
 # --- MOTOR DE RECONOCIMIENTO ---
 def get_infra_data(domain):
-    data = {"ip": "N/A", "owner": "N/A", "ssl_cn": "N/A", "ssl_exp": "N/A", "ports": [], "whois_raw": ""}
+    data = {
+        "ip": "N/A", 
+        "owner": "N/A", 
+        "network": "N/A", 
+        "asn": "N/A",
+        "ssl_cn": "N/A", 
+        "ssl_exp": "N/A", 
+        "ports": [], 
+        "whois_raw": ""
+    }
     
-    # 1. Resolución DNS Robusta (Sigue CNAME hasta obtener el registro A)
+    # 1. Resolución DNS Robusta (Sigue CNAME hasta obtener la IP final)
     try:
-        # Ejecuta dig para obtener la cadena completa de resolución
         res_dns = subprocess.run(["dig", domain, "A", "+short"], capture_output=True, text=True, timeout=5)
         lines = res_dns.stdout.splitlines()
-        
-        # Filtra para encontrar solo direcciones IPv4 válidas
         ips = [l for l in lines if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", l)]
         
         if ips:
-            # Selecciona la IP final de la cadena de resolución
-            data["ip"] = ips[-1] 
+            data["ip"] = ips[-1] # Selecciona la IP final de la cadena
             
-            # 2. WHOIS ejecutado sobre la IP encontrada
+            # 2. WHOIS sobre la IP encontrada
             res_w = subprocess.run(["whois", data["ip"]], capture_output=True, text=True, timeout=5)
             data["whois_raw"] = res_w.stdout
+            
             for line in res_w.stdout.splitlines():
-                if any(x in line.lower() for x in ["org-name", "descr", "organization", "netname"]):
-                    data["owner"] = line.split(":", 1)[1].strip()
-                    break
+                line_l = line.lower()
+                # Extrae Dueño (Organization/Descr)
+                if any(x in line_l for x in ["org-name", "descr", "organization", "netname"]):
+                    if ":" in line: data["owner"] = line.split(":", 1)[1].strip()
+                # Extrae Rango de Red (CIDR)
+                if "cidr" in line_l:
+                    if ":" in line: data["network"] = line.split(":", 1)[1].strip()
+                # Extrae ASN
+                if "origin" in line_l or "aut-num" in line_l:
+                    if ":" in line: data["asn"] = line.split(":", 1)[1].strip()
     except Exception:
-        # Fallback a socket en caso de fallo de comandos de sistema
-        try: 
-            data["ip"] = socket.gethostbyname(domain)
-            res_w = subprocess.run(["whois", data["ip"]], capture_output=True, text=True, timeout=5)
-            # Reintenta WHOIS con la IP de fallback
-            for line in res_w.stdout.splitlines():
-                if any(x in line.lower() for x in ["org-name", "descr", "organization", "netname"]):
-                    data["owner"] = line.split(":", 1)[1].strip()
-                    break
+        try: data["ip"] = socket.gethostbyname(domain)
         except: pass
 
-    # 3. Certificado (Common Name y Expiración)
+    # 3. Certificado (CN y Expiración)
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection((domain, 443), timeout=4) as sock:
@@ -67,7 +72,7 @@ def get_infra_data(domain):
                 data["ssl_exp"] = cert.get('notAfter', 'N/A')
     except: pass
 
-    # 4. Escaneo de Puertos Críticos
+    # 4. Puertos
     for p in [80, 443, 8080, 8443, 2083]:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.4)
@@ -76,7 +81,7 @@ def get_infra_data(domain):
     return data
 
 # --- INTERFAZ ---
-st.title("🛡️ EdgeSight SE")
+st.title("🛡️ NinjaZight SE")
 target = st.text_input("Dominio:", placeholder="empresa.com", label_visibility="collapsed")
 
 if st.button("🚀 Iniciar Auditoría"):
@@ -87,7 +92,6 @@ if st.button("🚀 Iniciar Auditoría"):
             infra = get_infra_data(dom)
             waf_raw = subprocess.run(["wafw00f", dom], capture_output=True, text=True).stdout or ""
             
-            # Análisis de cabeceras HTTP/S
             try:
                 r = requests.get(f"https://{dom}", timeout=5, verify=False)
                 srv = r.headers.get("Server", "Desconocido")
@@ -95,14 +99,13 @@ if st.button("🚀 Iniciar Auditoría"):
                 h_ok = all(x in r.headers for x in ["Strict-Transport-Security", "Content-Security-Policy"])
             except: srv, cdn, h_ok = "N/A", "N/A", False
 
-            # Prompt técnico optimizado para la venta de Akamai
-            prompt = f"Dom: {dom}, IP: {infra['ip']} ({infra['owner']}), CN: {infra['ssl_cn']}, SSL Exp: {infra['ssl_exp']}, Ports: {infra['ports']}, WAF: {waf_raw[:150]}, Srv: {srv}, CDN: {cdn}, SecHeaders: {h_ok}. Analiza anomalías y oportunidad Akamai en 5 bullets secos."
+            prompt = f"Dom: {dom}, IP: {infra['ip']} ({infra['owner']}), Red: {infra['network']}, ASN: {infra['asn']}, CN: {infra['ssl_cn']}, SSL Exp: {infra['ssl_exp']}, Ports: {infra['ports']}, WAF: {waf_raw[:150]}, Srv: {srv}, CDN: {cdn}, SecHeaders: {h_ok}. Analiza anomalías y oportunidad Akamai en 5 bullets secos."
             res = CLIENT.models.generate_content(model=MODEL_ID, contents=prompt)
             status.update(label="Análisis Finalizado", state="complete")
 
-        # --- Dashboard de Métricas (Siempre Visible) ---
+        # --- Dashboard ---
         c1, c2, c3 = st.columns(3)
-        c1.metric("IP Pública", infra['ip'], infra['owner'][:25])
+        c1.metric("IP Pública", infra['ip'], f"{infra['owner'][:20]} ({infra['asn']})")
         c2.metric("Certificado (CN)", infra['ssl_cn'][:30])
         c3.metric("Vencimiento SSL", infra['ssl_exp'][:15])
 
@@ -113,7 +116,7 @@ if st.button("🚀 Iniciar Auditoría"):
 
         st.divider()
 
-        # --- Resultados en Pestañas ---
+        # --- Pestañas ---
         tab_brief, tab_tech = st.tabs(["⚡ Briefing Estratégico", "🛠️ Detalle Técnico"])
         
         with tab_brief:
@@ -121,15 +124,14 @@ if st.button("🚀 Iniciar Auditoría"):
             
         with tab_tech:
             st.json({
-                "dominio": dom,
                 "ip_resolucion": infra['ip'],
-                "infra_owner": infra['owner'],
+                "red_cidr": infra['network'],
+                "asn": infra['asn'],
+                "proveedor": infra['owner'],
                 "common_name": infra['ssl_cn'],
-                "expiracion_ssl": infra['ssl_exp'],
-                "puertos_abiertos": infra['ports'],
-                "servidor": srv,
-                "cdn_detectada": cdn
+                "puertos": infra['ports'],
+                "servidor": srv
             })
             if infra["whois_raw"]:
-                with st.expander("Ver WHOIS Crudo"):
+                with st.expander("Ver WHOIS Completo"):
                     st.code(infra["whois_raw"])
