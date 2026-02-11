@@ -1,5 +1,5 @@
 streamlit
 google-genai
-w00fwaf
+wafw00f
 fpdf2
 requests
