@@ -9,90 +9,137 @@ import os
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="EdgeSight | Akamai Sales Intel", layout="wide", page_icon="🛡️")
 
-# --- API CLIENT ---
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = ""
+# Estilo corporativo Akamai
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #005595; color: white; font-weight: bold; }
+    .stDownloadButton>button { background-color: #28a745; color: white; }
+    </style>
+    """, unsafe_allow_html=True)
 
-with st.sidebar:
-    st.title("Configuración")
-    st.session_state.api_key = st.text_input("Gemini API Key", type="password", value=st.session_state.api_key)
+# --- INICIALIZACIÓN DE CLIENTE GEMINI (vía Secrets) ---
+try:
+    # Intenta obtener la clave desde st.secrets
+    api_key = st.secrets["GEMINI_API_KEY"]
+    client = genai.Client(api_key=api_key)
+except Exception:
+    st.error("❌ No se encontró la GEMINI_API_KEY en los Secrets de Streamlit.")
+    st.stop()
 
 # --- FUNCIONES TÉCNICAS ---
 def run_command(cmd_list):
     if not shutil.which(cmd_list[0]):
-        return f"Error: {cmd_list[0]} no encontrado."
+        return f"Error: {cmd_list[0]} no está disponible en el entorno."
     try:
-        # Añadido timeout y captura de errores
         result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=60)
         return f"{result.stdout}\n{result.stderr}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error en ejecución: {str(e)}"
 
-def get_http_intelligence(url):
+def get_http_intel(url):
     try:
         if not url.startswith('http'): url = 'https://' + url
         res = requests.get(url, timeout=10, verify=False)
         h = res.headers
         return {
             "Server": h.get("Server", "Oculto"),
-            "CDN": h.get("X-Cache", h.get("CF-Cache-Status", "N/A")),
+            "CDN-Header": h.get("X-Cache", h.get("CF-Cache-Status", "N/A")),
             "HSTS": "Strict-Transport-Security" in h,
             "CSP": "Content-Security-Policy" in h
         }
     except:
-        return {"Error": "No se pudo conectar"}
+        return {"Error": "No se pudo conectar al host"}
 
-# --- INTERFAZ ---
-st.title("🛡️ EdgeSight: Akamai Intelligence")
+# --- INTERFAZ PRINCIPAL ---
+st.title("🛡️ EdgeSight: Akamai Intelligence Tool")
+st.markdown("### Herramienta de Prospección Técnica para Sales Engineers")
 
-target = st.text_input("Dominio del Prospecto:", placeholder="ejemplo.com")
+target = st.text_input("Dominio del Prospecto (ej: empresa.com):", placeholder="dominio.com")
 
-if st.button("🚀 Iniciar Auditoría"):
-    if not st.session_state.api_key:
-        st.error("Falta API Key.")
-    elif target:
+if st.button("🚀 Iniciar Auditoría de Venta"):
+    if target:
+        # Limpieza de dominio
         clean_target = target.replace("https://", "").replace("http://", "").split('/')[0]
         
-        with st.status("🔍 Analizando...", expanded=True) as status:
-            # Cambio de w00fwaf a wafw00f (comando oficial)
-            st.write("🛰️ Identificando WAF (wafw00f)...")
+        with st.status("🔍 Analizando infraestructura del prospecto...", expanded=True) as status:
+            st.write("🛰️ Ejecutando WAFw00f (Detección de seguridad)...")
             waf_info = run_command(["wafw00f", clean_target])
             
-            st.write("🔎 Huella digital (WhatWeb)...")
+            st.write("🔎 Ejecutando WhatWeb (Huella digital)...")
             whatweb_info = run_command(["whatweb", "--aggression", "1", clean_target])
             
-            st.write("🧠 Generando reporte IA...")
-            client = genai.Client(api_key=st.session_state.api_key)
+            st.write("🌐 Verificando Headers de Seguridad...")
+            http_intel = get_http_intel(clean_target)
             
-            prompt = f"Actúa como SE de Akamai. Analiza estos datos de {clean_target} y crea un pitch de venta: \nLogs:\n{whatweb_info}\n{waf_info}"
-            response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-            report_text = response.text
-            status.update(label="Análisis Completo", state="complete")
+            st.write("🧠 Generando reporte estratégico con Gemini...")
+            
+            # Contexto para la IA
+            context = f"""
+            DOMINIO: {clean_target}
+            WAFW00F LOG: {waf_info}
+            WHATWEB LOG: {whatweb_info}
+            HTTP HEADERS: {http_intel}
+            """
+            
+            prompt = f"""
+            Eres un Solution Engineer de Akamai especializado en Cloud Security y Delivery.
+            Analiza los datos técnicos adjuntos para el sitio {clean_target}.
+            
+            Tu objetivo es armar un resumen para el equipo de ventas (Account Executives) que incluya:
+            1. RECUENTO TECNOLÓGICO: ¿Qué CDN y WAF usan? ¿Están con la competencia (Cloudflare, AWS, Fastly)?
+            2. BRECHAS DE SEGURIDAD: ¿Tienen headers de seguridad? ¿El servidor está expuesto?
+            3. PITCH DE VENTA: ¿Por qué este cliente necesita Akamai App & API Protector o Bot Manager hoy mismo?
+            4. PERFORMANCE: Si detectas que no usan CDN o el servidor es lento, menciona 'Akamai Ion'.
+            
+            Sé profesional, persuasivo y técnico.
+            """
+            
+            try:
+                response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+                report_text = response.text
+                status.update(label="Análisis Finalizado", state="complete")
+            except Exception as e:
+                st.error(f"Error con la API de Gemini: {e}")
+                report_text = "Error al generar el reporte."
 
-        # --- TABS ---
-        t1, t2, t3 = st.tabs(["📊 Estrategia", "🔧 Técnica", "📥 PDF"])
+        # --- TABS DE RESULTADOS ---
+        t_sales, t_tech, t_pdf = st.tabs(["📊 Estrategia de Venta", "🔧 Detalles Técnicos", "📥 Exportar"])
         
-        with t1:
+        with t_sales:
             st.markdown(report_text)
             
-        with t2:
-            st.code(f"--- WAF DETECTION ---\n{waf_info}\n\n--- WHATWEB ---\n{whatweb_info}")
+        with t_tech:
+            st.write("**Headers de Seguridad Detectados:**")
+            st.json(http_intel)
+            with st.expander("Ver Logs Crudos de Herramientas"):
+                st.subheader("WhatWeb")
+                st.code(whatweb_info)
+                st.subheader("WAFw00f")
+                st.code(waf_info)
 
-        with t3:
-            # Generación de PDF con fpdf2
+        with t_pdf:
+            st.info("Genera un PDF para el briefing de la cuenta.")
             pdf = FPDF()
             pdf.add_page()
             pdf.set_font("Helvetica", size=12)
-            pdf.cell(200, 10, txt="Akamai Sales Intelligence Report", ln=1, align='C')
+            pdf.cell(200, 10, txt=f"Akamai Sales Intelligence - {clean_target}", ln=1, align='C')
             pdf.ln(10)
-            # Limpiar caracteres no latin-1
-            safe_text = report_text.encode('latin-1', 'replace').decode('latin-1')
-            pdf.multi_cell(0, 10, txt=safe_text)
+            
+            # Limpiar texto para evitar errores de encoding
+            clean_pdf_text = report_text.encode('latin-1', 'replace').decode('latin-1')
+            pdf.multi_cell(0, 10, txt=clean_pdf_text)
             
             pdf_bytes = pdf.output()
             st.download_button(
-                label="Descargar PDF",
+                label="📥 Descargar Reporte PDF",
                 data=pdf_bytes,
-                file_name=f"Akamai_{clean_target}.pdf",
+                file_name=f"Akamai_Briefing_{clean_target}.pdf",
                 mime="application/pdf"
             )
+    else:
+        st.error("Por favor, ingresa un dominio para analizar.")
+
+st.sidebar.markdown("---")
+st.sidebar.image("https://www.akamai.com/content/dam/site/en/images/logo/akamai-logo-rvb.png", width=150)
+st.sidebar.caption("Herramienta de soporte preventa basada en reconocimiento pasivo.")
