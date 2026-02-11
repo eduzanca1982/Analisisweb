@@ -1,6 +1,5 @@
 streamlit
-google-generativeai
-pandas
+google-genai
 w00fwaf
-fpdf
+fpdf2
 requests
