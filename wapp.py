@@ -1,138 +1,121 @@
 import streamlit as st
 import subprocess
-import google.generativeai as genai
+from google import genai
 import shutil
 import requests
 from fpdf import FPDF
-import base64
+import os
 
-# --- CONFIGURACIÓN ---
-st.set_page_config(page_title="EdgeSight | Akamai Technical Sales", layout="wide", page_icon="🛡️")
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(page_title="EdgeSight | Akamai Sales Intel", layout="wide", page_icon="🛡️")
 
-# --- LÓGICA DE PDF ---
-class PDF(FPDF):
-    def header(self):
-        self.set_font('Arial', 'B', 15)
-        self.cell(0, 10, 'Akamai Prospect Intelligence Report', 0, 1, 'C')
-        self.ln(5)
+# CSS para mejorar la estética corporativa
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #005595; color: white; }
+    .stDownloadButton>button { background-color: #28a745; color: white; }
+    </style>
+    """, unsafe_allow_html=True)
 
-def create_download_link(text, filename):
-    pdf = PDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=11)
-    # Limpieza de caracteres para el PDF
-    clean_text = text.encode('latin-1', 'replace').decode('latin-1')
-    pdf.multi_cell(0, 10, txt=clean_text)
-    html = pdf.output(dest="S")
-    b64 = base64.b64encode(html.encode('latin-1')).decode()
-    return f'<a href="data:application/pdf;base64,{b64}" download="{filename}.pdf">📥 Descargar Reporte PDF</a>'
+# --- API CLIENT (NUEVO SDK) ---
+if 'api_key' not in st.session_state:
+    st.session_state.api_key = ""
 
-# --- API GEMINI ---
-GEMINI_API_KEY = st.sidebar.text_input("Gemini API Key", type="password")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+with st.sidebar:
+    st.title("Configuración")
+    st.session_state.api_key = st.text_input("Gemini API Key", type="password", value=st.session_state.api_key)
+    st.info("Esta app usa escaneos pasivos para ayudar en la preventa de soluciones Akamai.")
 
-# --- FUNCIONES TÉCNICAS ADICIONALES ---
-def get_security_headers(url):
-    """Analiza encabezados de seguridad críticos."""
+# --- FUNCIONES TÉCNICAS ---
+def run_command(cmd_list):
+    """Ejecuta comandos de sistema de forma segura."""
+    if not shutil.which(cmd_list[0]):
+        return f"Error: {cmd_list[0]} no está instalado en el servidor."
+    try:
+        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=40)
+        return f"{result.stdout}\n{result.stderr}"
+    except Exception as e:
+        return f"Error de ejecución: {str(e)}"
+
+def get_http_intelligence(url):
+    """Analiza headers de seguridad y servidor."""
     try:
         if not url.startswith('http'): url = 'https://' + url
-        response = requests.get(url, timeout=10)
-        h = response.headers
-        analysis = {
+        res = requests.get(url, timeout=10, verify=False) # verify=False para evitar problemas con certs autofirmados en el escaneo
+        h = res.headers
+        return {
+            "Server": h.get("Server", "Oculto"),
+            "CDN-Check": h.get("X-Cache", h.get("CF-Cache-Status", "N/A")),
             "HSTS": "Strict-Transport-Security" in h,
             "CSP": "Content-Security-Policy" in h,
-            "X-Frame": "X-Frame-Options" in h,
-            "Server": h.get("Server", "No expuesto")
+            "Permissions-Policy": "Permissions-Policy" in h
         }
-        return analysis
-    except:
-        return None
-
-def run_command(cmd_list):
-    if not shutil.which(cmd_list[0]):
-        return f"Error: {cmd_list[0]} no instalado."
-    try:
-        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=45)
-        return result.stdout
     except Exception as e:
-        return str(e)
+        return {"Error": str(e)}
 
-# --- INTERFAZ ---
-st.title("🛡️ EdgeSight: Prospección Técnica Akamai")
+# --- INTERFAZ PRINCIPAL ---
+st.title("🛡️ EdgeSight: Akamai Intelligence Tool")
+st.subheader("Análisis de infraestructura para Sales Engineering")
 
-target = st.text_input("Dominio del cliente (ej: empresa.com):")
+target = st.text_input("Dominio del Prospecto (ej: prospecto.com)", placeholder="dominio.com")
 
-if st.button("Ejecutar Análisis Full"):
-    if not GEMINI_API_KEY:
-        st.error("Ingresa la API Key en la barra lateral.")
+if st.button("🚀 Iniciar Auditoría de Venta"):
+    if not st.session_state.api_key:
+        st.error("Por favor, ingresa la API Key de Gemini en la barra lateral.")
     elif target:
+        # Sanitizar target
         clean_target = target.replace("https://", "").replace("http://", "").split('/')[0]
         
-        with st.status("🛠️ Procesando auditoría multinivel...", expanded=True) as status:
-            # 1. Herramientas Externas
-            st.write("Detectando WAF y CDN...")
-            waf_out = run_command(["w00fwaf", clean_target])
-            whatweb_out = run_command(["whatweb", "--aggression", "1", clean_target])
+        with st.status("🔍 Realizando reconocimiento pasivo...", expanded=True) as status:
+            st.write("🛰️ Identificando WAF...")
+            waf_info = run_command(["w00fwaf", clean_target])
             
-            # 2. Análisis Técnico Propio (Headers)
-            st.write("Verificando encabezados de seguridad...")
-            headers_info = get_security_headers(clean_target)
+            st.write("🔎 Analizando huella digital (WhatWeb)...")
+            whatweb_info = run_command(["whatweb", "--aggression", "1", clean_target])
             
-            # 3. Inteligencia Artificial
-            st.write("Generando estrategia comercial...")
-            contexto = f"""
-            Dominio: {clean_target}
-            WhatWeb: {whatweb_out}
-            WAF Detection: {waf_out}
-            Security Headers: {headers_info}
-            """
+            st.write("🌐 Verificando Headers de Seguridad...")
+            http_intel = get_http_intelligence(clean_target)
             
-            prompt = f"""
-            Eres un Solution Engineer de Akamai. Analiza estos datos para una venta estratégica:
-            1. Infraestructura: ¿Qué usan hoy?
-            2. Brechas Técnicas: ¿Tienen HSTS o CSP? ¿El servidor expone versión?
-            3. Argumento Akamai: Si no tienen WAF o usan competencia (Cloudflare/AWS), ¿cómo ayuda Akamai App & API Protector? 
-            4. Performance: ¿Hay signos de que necesiten Ion o Image & Video Manager?
-            Responde de forma ejecutiva.
-            """
-            
-            ai_report = model.generate_content(prompt).text
-            status.update(label="Análisis Finalizado", state="complete")
+            st.write("🧠 Consultando con Gemini AI...")
+            try:
+                client = genai.Client(api_key=st.session_state.api_key)
+                full_context = f"""
+                CLIENTE: {clean_target}
+                WHATWEB: {whatweb_info}
+                WAF: {waf_info}
+                HEADERS: {http_intel}
+                """
+                
+                prompt = f"""
+                Eres un Solution Engineer de Akamai. Analiza estos datos técnicos para una oportunidad de venta.
+                Estructura tu respuesta:
+                1. STACK ACTUAL: Proveedores detectados.
+                2. PAIN POINTS: Vulnerabilidades (falta de headers) o uso de competidores.
+                3. PROPUESTA AKAMAI: Por qué necesitan 'App & API Protector' o 'Ion'.
+                """
+                
+                response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+                report_text = response.text
+                status.update(label="Análisis Completo", state="complete")
+            except Exception as e:
+                st.error(f"Error con Gemini: {e}")
+                report_text = "No se pudo generar el reporte IA."
 
-        # --- MOSTRAR RESULTADOS ---
-        t1, t2, t3 = st.tabs(["📊 Estrategia de Venta", "🔧 Auditoría Técnica", "📄 Reporte PDF"])
+        # --- TABS DE RESULTADOS ---
+        tab_sales, tab_tech, tab_pdf = st.tabs(["📊 Estrategia Comercial", "🔧 Detalles Técnicos", "📥 Exportar"])
         
-        with t1:
-            st.markdown(ai_report)
-        
-        with t2:
+        with tab_sales:
+            st.markdown(report_text)
+            
+        with tab_tech:
             col1, col2 = st.columns(2)
             with col1:
-                st.subheader("Security Headers")
-                if headers_info:
-                    for k, v in headers_info.items():
-                        st.write(f"{'✅' if v else '❌'} {k}")
+                st.write("**Seguridad de Headers:**")
+                st.json(http_intel)
             with col2:
-                st.subheader("Detección de Servidor")
-                st.code(headers_info.get("Server") if headers_info else "N/A")
-
-        with t3:
-            st.info("Genera un documento listo para enviar al Account Executive.")
-            pdf_link = create_download_link(ai_report, f"Reporte_Akamai_{clean_target}")
-            st.markdown(pdf_link, unsafe_allow_html=True)
+                st.write("**Detección de Infraestructura:**")
+                st.text(f"WAF: {waf_info[:200]}...") # Resumen corto
             
-            st.subheader("Raw Technical Logs")
-            with st.expander("Ver logs completos"):
-                st.text(contexto)
-
-# --- IDEAS ADICIONALES PARA EL ANÁLISIS ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("Próximas Mejoras Sugeridas:")
-st.sidebar.write("""
-- **Análisis DNS**: Chequear si usan DNS de Akamai o competidor (Route53/Cloudflare).
-- **Time to First Byte (TTFB)**: Medir velocidad para vender **Ion**.
-- **Detección de Cookies**: Buscar cookies de balanceadores conocidos.
-- **SSL Labs Grade**: Integrar API de Qualys para ver la nota del certificado.
-""")
+            with st.expander("Ver Logs Crudos Completos"):
+                st.code(f"--- WHATWEB ---\n{whatweb_info}\n\n--- W0
