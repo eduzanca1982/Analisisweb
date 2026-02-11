@@ -5,12 +5,10 @@ import shutil
 import requests
 import socket
 import ssl
-from datetime import datetime
 from fpdf import FPDF
 
-st.set_page_config(page_title="EdgeSight v2", layout="wide")
+st.set_page_config(page_title="EdgeSight SE Edition", layout="wide", page_icon="⚡")
 
-# --- BOOT & CONFIG ---
 @st.cache_resource
 def boot_gemini():
     try:
@@ -20,110 +18,106 @@ def boot_gemini():
 
 CLIENT, MODEL_ID = boot_gemini()
 
-# --- FUNCIONES TÉCNICAS ---
+def scan_ports(domain):
+    ports = [80, 443, 8080, 8443, 2082, 2083, 2086, 2087]
+    open_ports = []
+    for port in ports:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                if s.connect_ex((domain, port)) == 0:
+                    open_ports.append(port)
+        except: pass
+    return open_ports
+
+def analyze_security_headers(headers):
+    checks = {
+        "HSTS": "Strict-Transport-Security" in headers,
+        "CSP": "Content-Security-Policy" in headers,
+        "X-Frame": "X-Frame-Options" in headers,
+        "X-Content-Type": "X-Content-Type-Options" in headers,
+        "Referrer-Policy": "Referrer-Policy" in headers
+    }
+    return checks
+
 def get_network_info(domain):
     try:
         ip = socket.gethostbyname(domain)
-        # WHOIS básico via comando
-        whois = subprocess.run(["whois", ip], capture_output=True, text=True, timeout=5).stdout
+        res = subprocess.run(["whois", ip], capture_output=True, text=True, timeout=10)
         owner = "Desconocido"
-        for line in whois.splitlines():
-            if "org-name" in line.lower() or "organization" in line.lower() or "descr" in line.lower():
+        for line in res.stdout.splitlines():
+            line_l = line.lower()
+            if any(k in line_l for k in ["org-name", "organization", "descr"]):
                 owner = line.split(":", 1)[1].strip()
                 break
-        return ip, owner, whois[:500] # Truncado para evitar errores de API
-    except: return "N/A", "N/A", "N/A"
+        return ip, owner
+    except: return "N/A", "N/A"
 
-def get_ssl_info(domain):
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((domain, 443), timeout=5) as sock:
-            with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert = ssock.getpeercert()
-                subject = dict(x[0] for x in cert['subject'])
-                common_name = subject.get('commonName')
-                org = subject.get('organizationName', 'N/A')
-                expires = cert.get('notAfter')
-                return {"cn": common_name, "org": org, "expiry": expires}
-    except: return None
+st.title("🛡️ EdgeSight: SE Intelligence Console")
 
-def get_http_intel(domain):
-    data = {}
-    for p in ["http", "https"]:
-        try:
-            r = requests.get(f"{p}://{domain}", timeout=5, verify=False)
-            data[p] = {"srv": r.headers.get("Server", "?"), "cdn": r.headers.get("X-Cache", "N/A")}
-        except: data[p] = "Error"
-    return data
+target = st.text_input("Dominio del cliente:", placeholder="ejemplo.com")
 
-# --- INTERFAZ ---
-st.title("🛡️ EdgeSight Intelligence")
-
-target = st.text_input("Dominio:", placeholder="ejemplo.com")
-
-if st.button("🚀 Escanear"):
+if st.button("🚀 Ejecutar Auditoría"):
     if target:
         dom = target.replace("https://", "").replace("http://", "").split('/')[0]
         
-        with st.status("Recolectando evidencia...", expanded=True):
-            # Ejecución de herramientas
-            waf = subprocess.run(["wafw00f", dom], capture_output=True, text=True).stdout
-            what = subprocess.run(["whatweb", dom], capture_output=True, text=True).stdout
-            ip, owner, whois_raw = get_network_info(dom)
-            ssl_data = get_ssl_info(dom)
-            http_data = get_http_intel(dom)
-
-            # Prompt visual y ultra-conciso
-            prompt = f"""
-            Analiza como SE de Akamai: {dom}
-            IP: {ip} ({owner}) | SSL: {ssl_data}
-            WAF Log: {waf[:400]} | WhatWeb: {what[:400]} | Headers: {http_data}
+        with st.status("Procesando inteligencia de infraestructura...", expanded=True):
+            ip, owner = get_network_info(dom)
             
-            OUTPUT: Máximo 5 bullets. Formato:
-            - **Infra**: [Servidor/CDN]
-            - **WAF**: [Estado/Marca]
-            - **SSL**: [CN y Vencimiento]
-            - **Red**: [IP y Owner]
-            - **Nota**: [Anomalía detectada o recomendación Akamai]
-            Sin texto adicional.
+            headers_data = {}
+            try:
+                r = requests.get(f"https://{dom}", timeout=10, verify=False)
+                headers_data = r.headers
+                sec_checks = analyze_security_headers(headers_data)
+            except:
+                sec_checks = {k: False for k in ["HSTS", "CSP", "X-Frame", "X-Content-Type", "Referrer-Policy"]}
+
+            waf = subprocess.run(["wafw00f", dom], capture_output=True, text=True).stdout or ""
+            what = subprocess.run(["whatweb", dom], capture_output=True, text=True).stdout or ""
+            ports = scan_ports(dom)
+
+            prompt = f"""
+            Analiza como Senior SE de Akamai: {dom}
+            Infra: IP {ip} ({owner}), Puertos abiertos: {ports}
+            WAF: {waf[:300]}
+            WhatWeb: {what[:300]}
+            Security Headers: {[k for k,v in sec_checks.items() if v]} (Missing: {[k for k,v in sec_checks.items() if not v]})
+            Server: {headers_data.get('Server', 'Oculto')}
+
+            Genera un informe visual de 5 bullets para un SE enfocado en anomalías técnicas y vectores de venta para Akamai. 
+            Menciona si los puertos abiertos sugieren servicios administrativos expuestos.
+            Sé directo, agnóstico de herramientas y técnico.
             """
             
             try:
                 res = CLIENT.models.generate_content(model=MODEL_ID, contents=prompt)
                 report = res.text
             except Exception as e:
-                report = "Error en IA: Intenta con un dominio menos complejo."
+                report = f"Error en procesamiento de inteligencia."
 
-        # --- DASHBOARD VISUAL ---
         c1, c2, c3 = st.columns(3)
         with c1: st.metric("IP Pública", ip, owner)
-        with c2: 
-            if ssl_data: st.metric("SSL Expira", ssl_data['expiry'][:12])
-        with c3:
-            cdn_val = http_data.get("https", {}).get("cdn", "N/A") if isinstance(http_data.get("https"), dict) else "N/A"
-            st.metric("CDN Detectado", cdn_val)
+        with c2: st.metric("Postura de Headers", f"{sum(sec_checks.values())}/5")
+        with c3: st.metric("Puertos Detectados", len(ports))
 
         st.markdown("---")
-        st.subheader("⚡ Estrategia Flash")
+        st.subheader("📝 Briefing Técnico y Anomalías")
         st.info(report)
 
-        # Tablas técnicas
-        with st.expander("Ver Auditoría Detallada"):
-            st.table({
-                "Protocolo": ["HTTP", "HTTPS"],
-                "Servidor": [http_data['http'].get('srv') if isinstance(http_data['http'], dict) else "N/A", 
-                             http_data['https'].get('srv') if isinstance(http_data['https'], dict) else "N/A"],
-                "CDN/Cache": [http_data['http'].get('cdn') if isinstance(http_data['http'], dict) else "N/A", 
-                              http_data['https'].get('cdn') if isinstance(http_data['https'], dict) else "N/A"]
-            })
-            if ssl_data:
-                st.write(f"**Certificado:** {ssl_data['cn']} | **Organización:** {ssl_data['org']}")
+        col_p, col_h = st.columns(2)
+        with col_p:
+            st.write("**Servicios Expuestos (Puertos):**")
+            st.write(f"`{', '.join(map(str, ports))}`" if ports else "Solo puertos estándar")
+        
+        with col_h:
+            st.write("**Seguridad en Headers:**")
+            h_status = " | ".join([f"{k} {'✅' if v else '❌'}" for k, v in sec_checks.items()])
+            st.markdown(h_status)
 
-        # PDF simple
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", 'B', 14)
-        pdf.cell(200, 10, f"Briefing: {dom}", ln=1)
+        pdf.cell(200, 10, f"SE Technical Report: {dom}", ln=1)
         pdf.set_font("Arial", size=10)
         pdf.multi_cell(0, 10, report.encode('latin-1', 'replace').decode('latin-1'))
-        st.download_button("📥 Descargar PDF", data=bytes(pdf.output()), file_name=f"{dom}.pdf")
+        st.download_button("📥 Descargar Reporte", data=bytes(pdf.output()), file_name=f"Intel_{dom}.pdf")
