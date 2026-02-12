@@ -1,151 +1,93 @@
 import streamlit as st
-import socket
-import ssl
-import datetime
 import subprocess
-import re
+import socket
 import json
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 
 st.set_page_config(page_title="Edge Snapshot", layout="wide")
-st.title("Scan Apukay EZ - WAF / CDN / TLS / WHOIS")
+st.title("Scan Apukay EZ - IA Driven Analysis")
 
-API_KEY = st.secrets.get("GOOGLE_API_KEY")
-
-# ===============================
-# ENGINE DE DETECCIÓN AGRESIVA
-# ===============================
-
-def get_raw_edge_data(host):
-    """Obtiene headers y banners mediante socket para evitar bloqueos de nivel de aplicación."""
+def get_ai_interpretation(raw_data):
+    """La IA procesa el volcado total de los comandos sin reglas rígidas."""
     try:
-        context = ssl.create_default_context()
-        with socket.create_connection((host, 443), timeout=5) as sock:
-            with context.wrap_socket(sock, server_hostname=host) as ssock:
-                # Request minimalista para forzar respuesta de headers
-                request = f"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
-                ssock.sendall(request.encode())
-                response = ssock.recv(4096).decode('utf-8', errors='ignore')
-                headers = {}
-                for line in response.split('\r\n')[1:]:
-                    if ": " in line:
-                        k, v = line.split(": ", 1)
-                        headers[k] = v
-                return headers, ssock.version()
-    except:
-        return {}, "N/A"
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash", 
+            google_api_key=st.secrets["GOOGLE_API_KEY"], 
+            temperature=0
+        )
+        
+        prompt = f"""
+        Sos un experto en infraestructura y ciberseguridad. 
+        Analizá el siguiente volcado de comandos técnicos (WhatWeb, Wafw00f, WHOIS, Headers).
+        
+        TAREAS:
+        1. Identificá el WAF y CDN basándote en CUALQUIER indicio (headers, rangos de IP, firmas de servidor).
+        2. Analizá la IP que responde y a quién pertenece realmente.
+        3. Detectá discrepancias (ej. el certificado dice una cosa, el WHOIS otra).
+        4. Exponé parámetros críticos de seguridad encontrados.
 
-def fingerprint_infrastructure(headers):
-    """Detecta proveedores mediante firmas de headers."""
-    h_str = json.dumps(headers).lower()
-    signatures = {
-        "Akamai": ["akamai", "x-akamai", "edge-cache-tag"],
-        "Cloudflare": ["cf-ray", "cloudflare", "__cfduid"],
-        "AWS CloudFront": ["x-amz-cf-", "cloudfront"],
-        "Imperva": ["x-iinfo", "incap-ses", "visid_incap"],
-        "Fastly": ["x-fastly", "fastly"]
-    }
-    found = [name for name, sigs in signatures.items() if any(s in h_str for s in sigs)]
-    return ", ".join(found) if found else "No detectado"
-
-def get_tls_details(host):
-    try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((host, 443), timeout=5) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as s:
-                cert = s.getpeercert()
-                expiry = datetime.datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
-                days_left = (expiry - datetime.datetime.utcnow()).days
-                issuer = dict(x[0] for x in cert['issuer']).get("organizationName")
-                return {"issuer": issuer, "expiry": str(expiry), "days_left": days_left, "version": s.version()}
+        FORMATO: Solo bullets técnicos directos. Sin introducciones.
+        
+        VOLCADO TÉCNICO:
+        {raw_data}
+        """
+        return llm.invoke([HumanMessage(content=prompt)]).content
     except Exception as e:
-        return {"error": str(e)}
+        return f"Error en procesamiento de IA: {str(e)}"
 
-def deep_whois(ip):
-    """Comando whois agresivo para extraer parámetros de red."""
+def run_aggressive_commands(target):
+    # Diccionario para acumular todo lo que la IA va a leer
+    audit_trail = {}
+
+    # 1. Resolución de IP
     try:
-        res = subprocess.run(["whois", ip], capture_output=True, text=True, timeout=10)
-        out = res.stdout
-        patterns = {
-            "Org": r"OrgName|Organization|owner",
-            "NetName": r"NetName|network:name",
-            "Range": r"NetRange|inetnum",
-            "Route": r"route"
-        }
-        extracted = {}
-        for key, p in patterns.items():
-            match = re.search(f"({p}):\s*(.*)", out, re.IGNORECASE)
-            extracted[key] = match.group(2).strip() if match else "N/A"
-        return extracted
-    except:
-        return {"error": "Whois failed"}
-
-# ===============================
-# IA OBSERVACIONES
-# ===============================
-
-def ai_analysis(snapshot):
-    if not API_KEY: return "Error: No API Key"
-    
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=API_KEY, temperature=0)
-    
-    prompt = f"""
-    Analiza este snapshot técnico. Detecta fallas de seguridad, discrepancias de IP/infraestructura y validez de certificados.
-    FORMATO: Solo bullets técnicos. Sin introducciones.
-    FOCO: Detectar WAF/CDN real, IP de origen probable (si aplica) y riesgos de vencimiento.
-
-    DATOS:
-    {json.dumps(snapshot, indent=2)}
-    """
-    return llm.invoke([HumanMessage(content=prompt)]).content
-
-# ===============================
-# UI STREAMLIT
-# ===============================
-
-target = st.text_input("Target Domain", placeholder="ejemplo.com")
-
-if st.button("Ejecutar Análisis") and target:
-    with st.spinner("Escaneando Edge..."):
         ip = socket.gethostbyname(target)
-        headers, tls_ver = get_raw_edge_data(target)
-        infra = fingerprint_infrastructure(headers)
-        tls = get_tls_details(target)
-        net_info = deep_whois(ip)
+        audit_trail["resolved_ip"] = ip
+    except:
+        ip = "N/A"
 
-        snapshot = {
-            "ip": ip,
-            "detected_infra": infra,
-            "tls_info": tls,
-            "net_whois": net_info,
-            "headers": headers
-        }
+    # 2. Wafw00f (Modo diagnóstico)
+    try:
+        w_proc = subprocess.run(['wafw00f', target, '-v'], capture_output=True, text=True)
+        audit_trail["wafw00f_full_output"] = w_proc.stdout
+    except Exception as e:
+        audit_trail["wafw00f_error"] = str(e)
 
-        # Dashboard de métricas
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("IP Responde", ip)
-        m2.metric("Infraestructura", infra)
-        m3.metric("Días Cert", tls.get("days_left", "N/A"))
-        m4.metric("Protocolo", tls.get("version", "N/A"))
+    # 3. WhatWeb (Modo agresivo nivel 3)
+    try:
+        ww_proc = subprocess.run(['whatweb', '-a', '3', target, '--color=never'], capture_output=True, text=True)
+        audit_trail["whatweb_full_output"] = ww_proc.stdout
+    except Exception as e:
+        audit_trail["whatweb_error"] = str(e)
+
+    # 4. WHOIS de la IP
+    if ip != "N/A":
+        try:
+            whois_proc = subprocess.run(['whois', ip], capture_output=True, text=True)
+            audit_trail["whois_ip_data"] = whois_proc.stdout
+        except:
+            audit_trail["whois_error"] = "No se pudo ejecutar whois"
+
+    return audit_trail
+
+target = st.text_input("Target Domain", placeholder="bancognb.com.py")
+
+if st.button("Ejecutar Auditoría IA") and target:
+    with st.spinner("Ejecutando comandos y procesando con IA..."):
+        # Ejecución de comandos
+        raw_audit_data = run_aggressive_commands(target)
+        
+        # Convertimos todo el diccionario a un string gigante para la IA
+        full_dump = json.dumps(raw_audit_data, indent=2)
+        
+        # Resultados
+        st.subheader("IA Technical Insights (Interpretación Dinámica)")
+        analysis = get_ai_interpretation(full_dump)
+        st.markdown(analysis)
 
         st.divider()
 
-        # Layout de datos
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.subheader("Network & WHOIS")
-            st.json(net_info)
-            st.subheader("Certificado")
-            st.json(tls)
-        
-        with col_right:
-            st.subheader("IA Technical Insights")
-            try:
-                insights = ai_analysis(snapshot)
-                st.markdown(insights)
-            except Exception as e:
-                st.error(f"Error en IA: {e}")
-            
-            with st.expander("Ver Raw Headers"):
-                st.json(headers)
+        # Debug/Raw data para el usuario
+        with st.expander("Ver volcado crudo enviado a la IA"):
+            st.code(full_dump, language="json")
