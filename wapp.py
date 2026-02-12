@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage
 
 st.set_page_config(page_title="Edge Snapshot", layout="wide", initial_sidebar_state="collapsed")
 
-# CSS para priorizar jerarquía visual de infraestructura
+# CSS para estética Dark Tech y jerarquía visual
 st.markdown("""
     <style>
     [data-testid="stAppViewContainer"] { background-color: #050505; }
@@ -42,7 +42,7 @@ def run_analysis_engine(data):
     try:
         api_key = st.secrets.get("GEMINI_API_KEY")
         engine = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
-        prompt = f"Auditoría técnica. Identificá WAF/CDN y pertenencia de red (WHOIS). Solo bullets directos:\n{data}"
+        prompt = f"Auditoría técnica de infraestructura. Identificá WAF/CDN y pertenencia de red (WHOIS). Solo bullets directos:\n{data}"
         return engine.invoke([HumanMessage(content=prompt)]).content
     except Exception as e: return f"Error motor: {str(e)}"
 
@@ -51,32 +51,37 @@ st.markdown("<h1 class='main-header'>🛡️ SCAN APUKAY EZ</h1>", unsafe_allow_
 target = st.text_input("Target Domain", placeholder="ejemplo.com.py")
 
 if st.button("INICIAR ESCANEO") and target:
-    with st.spinner("Extrayendo huellas de red..."):
+    with st.spinner("Analizando bordes y red..."):
         # Ejecución técnica
-        ip = socket.gethostbyname(target)
+        try:
+            ip = socket.gethostbyname(target)
+        except:
+            ip = "Error IP"
+            
         w_proc = subprocess.run(['wafw00f', target, '-v'], capture_output=True, text=True)
         ww_proc = subprocess.run(['whatweb', '-a', '3', target, '--color=never'], capture_output=True, text=True)
-        whois_proc = subprocess.run(['whois', ip], capture_output=True, text=True)
+        whois_proc = subprocess.run(['whois', ip], capture_output=True, text=True) if ip != "Error IP" else type('obj', (object,), {'stdout': 'N/A'})
         cert = get_cert_details(target)
 
-        # Extracción de Server de WhatWeb (simplificado)
+        # Extracción de WebServer desde WhatWeb
         server_match = [line for line in ww_proc.stdout.split(',') if 'Server[' in line]
-        server_label = server_match[0].strip() if server_match else "No detectado"
+        server_label = server_match[0].strip().replace("Server[", "").replace("]", "") if server_match else "No detectado"
 
         # FILA 1: INFRAESTRUCTURA DE BORDE (PRIMARIA)
         st.markdown("### 🌐 Capa de Infraestructura")
         r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
         
         # Lógica de detección rápida para UI
-        waf_ui = "Detección pendiente..."
-        if "incapsula" in (w_proc.stdout + whois_proc.stdout).lower(): waf_ui = "Imperva / Incapsula"
-        elif "cloudflare" in (w_proc.stdout + whois_proc.stdout).lower(): waf_ui = "Cloudflare"
-        elif "akamai" in (w_proc.stdout + whois_proc.stdout).lower(): waf_ui = "Akamai"
+        full_output_lower = (w_proc.stdout + whois_proc.stdout).lower()
+        waf_ui = "No detectado"
+        if "incapsula" in full_output_lower or "imperva" in full_output_lower: waf_ui = "Imperva / Incapsula"
+        elif "cloudflare" in full_output_lower: waf_ui = "Cloudflare"
+        elif "akamai" in full_output_lower: waf_ui = "Akamai"
         
         r1_c1.metric("HOST IP", ip)
         r1_c2.metric("WAF / CDN", waf_ui)
-        r1_c3.metric("WEB SERVER", server_label.replace("Server[", "").replace("]", ""))
-        r1_c4.metric("RED (WHOIS)", "Ver Detalle")
+        r1_c3.metric("WEB SERVER", server_label)
+        r1_c4.metric("RED (WHOIS)", "Identificada" if "Error" not in ip else "N/A")
 
         # FILA 2: SEGURIDAD Y CERTIFICADOS (SECUNDARIA)
         st.markdown("### 🔐 Capa de Seguridad")
@@ -93,7 +98,14 @@ if st.button("INICIAR ESCANEO") and target:
         
         with c_left:
             st.markdown("#### 📜 Análisis de Borde")
-            audit_dump = {"ip": ip, "waf": w_proc.stdout, "tech": ww_proc.stdout, "whois": whois_proc.stdout}
+            # Unificación de la variable que causaba el NameError
+            audit_data = {
+                "ip": ip, 
+                "waf": w_proc.stdout, 
+                "tech": ww_proc.stdout, 
+                "whois": whois_proc.stdout,
+                "cert": cert
+            }
             st.info(run_analysis_engine(json.dumps(audit_data)))
 
         with c_right:
