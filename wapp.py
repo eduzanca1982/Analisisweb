@@ -1,928 +1,741 @@
 # app.py
-# NinjaZight SE - robusto + WHOIS consistente + detección WAF/CDN “agresiva”
+# EdgeSight SE - Light PT (preventa técnico) - "bulletproof"
+# - 1 solo llamado a Gemini por corrida (cuando ya está TODO el output)
+# - cache + session_state (evita reruns llamando de nuevo)
+# - retry/backoff sólo para 429 RESOURCE_EXHAUSTED
+# - degrada sin romper si faltan tools (dig/whois/wafw00f/whatweb)
+# - wording mínimo: bullets + alerts
 #
-# Cambios clave vs tu versión:
-# - WHOIS: si ipwhois no está instalado o falla, cae a `whois` (subprocess) y PARSEA NetName/Org/CIDR/OriginAS.
-# - WAF/CDN: combina señales de headers + DNS CNAME + herramientas opcionales (wafw00f/whatweb).
-# - Salidas: si no hay evidencia -> "No detectado" (no "N/A").
-#
-# Reqs: streamlit, requests
-# Opcionales: dnspython, ipwhois, google-genai, wafw00f (binario), whatweb (binario)
-#
-# Ejecutar: streamlit run app.py
+# Ejecutá sólo con autorización.
 
-import streamlit as st
+import hashlib
+import json
+import random
+import re
 import socket
 import ssl
-import re
-import time
-import json
-import ipaddress
 import subprocess
-import shutil
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import streamlit as st
+from fpdf import FPDF
 
-# -----------------------------
-# Page config
-# -----------------------------
-st.set_page_config(page_title="NinjaZight SE", layout="wide", page_icon="🥷")
+# Optional Gemini
+try:
+    from google import genai
+except Exception:
+    genai = None
 
-UNKNOWN = "No detectado"
-UA_REAL = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+# -----------------------
+# Streamlit
+# -----------------------
+st.set_page_config(page_title="EdgeSight SE - Light PT", layout="wide")
 
-DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$")
+UA = "EdgeSightSE-LightPT/2.0"
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$")
 
-SEC_HEADERS = [
-    "strict-transport-security",
-    "content-security-policy",
-    "x-content-type-options",
-    "x-frame-options",
-    "referrer-policy",
-    "permissions-policy",
+# -----------------------
+# Ports (Top 100 web + infra)
+# -----------------------
+TOP100_WEB_INFRA = sorted(list(dict.fromkeys([
+    # Web
+    80, 81, 88, 443, 444, 591, 593, 8000, 8008, 8010, 8080, 8081, 8088, 8090, 8181, 8222,
+    8443, 8444, 8888, 9000, 9090, 9443,
+    # Admin/proxy/app
+    2082, 2083, 2086, 2087, 2095, 2096, 3000, 3001, 4000, 4440, 5000, 5001, 5601, 5984,
+    7001, 7002, 7080, 7443, 7777, 8880, 9200, 9300,
+    # Infra common
+    21, 22, 23, 25, 53, 67, 68, 69, 110, 111, 123, 135, 137, 138, 139, 143, 161, 389,
+    445, 512, 513, 514, 515, 587, 631, 636, 873, 902, 989, 990, 993, 995,
+    # DB/cache/search/queue
+    1433, 1521, 1830, 2049, 2375, 2376, 2483, 2484,
+    27017, 27018, 27019, 28017, 3306, 3389, 50000, 5432,
+    5672, 5671, 5900, 5985, 5986, 6379, 6380, 7199,
+    8082, 8500, 8778, 9042, 9160, 11211, 15672, 16379, 2181, 9092
+])))[:100]
+
+SENSITIVE_PATHS = [
+    "/.git/", "/.env", "/.DS_Store", "/backup.zip", "/backup.tar.gz", "/db.sql", "/dump.sql",
+    "/config.php.bak", "/config.yml", "/config.json", "/phpinfo.php",
+    "/server-status", "/server-status?auto",
+    "/wp-admin/", "/wp-login.php", "/xmlrpc.php",
+    "/admin/", "/administrator/", "/login/", "/signin/", "/console", "/manage", "/manager/html",
+    "/actuator", "/actuator/health", "/actuator/env",
+    "/swagger", "/swagger-ui", "/swagger-ui/index.html", "/openapi.json",
+    "/graphql", "/.well-known/security.txt"
 ]
 
-# -----------------------------
-# Optional deps (soft-import)
-# -----------------------------
-DNSPYTHON_OK = False
-IPWHOIS_OK = False
-try:
-    import dns.resolver  # type: ignore
-    DNSPYTHON_OK = True
-except Exception:
-    DNSPYTHON_OK = False
+SEC_HEADERS = [
+    "Strict-Transport-Security",
+    "Content-Security-Policy",
+    "X-Frame-Options",
+    "X-Content-Type-Options",
+    "Referrer-Policy",
+    "Permissions-Policy",
+]
 
-try:
-    from ipwhois import IPWhois  # type: ignore
-    IPWHOIS_OK = True
-except Exception:
-    IPWHOIS_OK = False
-
-# Gemini (opcional)
-GEMINI_OK = False
-CLIENT = None
-MODEL_ID = None
-try:
-    from google import genai  # type: ignore
-    GEMINI_OK = True
-except Exception:
-    GEMINI_OK = False
+RISKY_PORTS = [21, 23, 25, 110, 143, 389, 445, 1433, 1521, 2049, 2375, 27017, 3306, 3389, 5432, 6379, 9200, 11211]
 
 
-# -----------------------------
+# -----------------------
 # Helpers
-# -----------------------------
-def normalize_target(inp: str) -> str:
-    s = (inp or "").strip()
-    s = s.replace("\u200b", "")
-    s = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)
-    s = s.split("/")[0].split("?")[0].split("#")[0]
-    s = s[:-1] if s.endswith(".") else s
-    return s.lower()
+# -----------------------
+def normalize_domain(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    x = raw.strip().lower()
+    x = x.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0].strip()
+    return x if DOMAIN_RE.match(x) else None
 
 
-def is_valid_domain(dom: str) -> bool:
-    if not dom or len(dom) > 253:
-        return False
-    if dom == "localhost":
-        return False
+def run_cmd(cmd: List[str], timeout: int = 12) -> Tuple[bool, str]:
     try:
-        ipaddress.ip_address(dom)
-        return False
-    except Exception:
-        pass
-    return bool(DOMAIN_RE.match(dom))
-
-
-def build_requests_session(total_retries: int = 2, backoff: float = 0.25) -> requests.Session:
-    sess = requests.Session()
-    retry = Retry(
-        total=total_retries,
-        connect=total_retries,
-        read=total_retries,
-        status=total_retries,
-        backoff_factor=backoff,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "HEAD"]),
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=24, pool_maxsize=24)
-    sess.mount("http://", adapter)
-    sess.mount("https://", adapter)
-    return sess
-
-
-def safe_get(
-    sess: requests.Session,
-    url: str,
-    timeout: float,
-    verify_tls: bool,
-    headers: Optional[Dict[str, str]] = None,
-) -> requests.Response:
-    h = {"User-Agent": UA_REAL}
-    if headers:
-        h.update(headers)
-    return sess.get(url, timeout=timeout, verify=verify_tls, headers=h, allow_redirects=True)
-
-
-def parse_cert_subject(cert: dict) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    subj = cert.get("subject", ())
-    for rdn in subj:
-        for k, v in rdn:
-            out[str(k)] = str(v)
-    return out
-
-
-def asn_norm(s: str) -> str:
-    if not s:
-        return UNKNOWN
-    m = re.search(r"AS\s*([0-9]+)", s, flags=re.IGNORECASE)
-    if m:
-        return f"AS{m.group(1)}"
-    m2 = re.search(r"\b([0-9]{3,10})\b", s)
-    if m2:
-        return f"AS{m2.group(1)}"
-    return s.strip()[:64]
-
-
-def which(cmd: str) -> Optional[str]:
-    p = shutil.which(cmd)
-    return p
-
-
-def run_cmd(args: List[str], timeout: int = 8) -> Tuple[int, str, str]:
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, (r.stdout or ""), (r.stderr or "")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        out = (res.stdout or "").strip()
+        err = (res.stderr or "").strip()
+        if res.returncode == 0:
+            return True, out
+        # tools a veces devuelven !=0 con output útil
+        return (bool(out), out or err or f"returncode={res.returncode}")
+    except FileNotFoundError:
+        return False, f"missing_tool={cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return False, f"timeout={' '.join(cmd)}"
     except Exception as e:
-        return 999, "", f"{e!r}"
+        return False, f"error={' '.join(cmd)} :: {e}"
 
 
-def first_nonempty(*vals: str) -> str:
-    for v in vals:
-        if v and v.strip() and v.strip() != "N/A":
-            return v.strip()
-    return UNKNOWN
-
-
-# -----------------------------
-# Data model
-# -----------------------------
-@dataclass
-class InfraData:
-    domain: str
-
-    # DNS
-    a_records: List[str]
-    cname_chain: List[str]
-    final_ip: str
-
-    # WHOIS
-    whois_owner: str
-    whois_cidr: str
-    whois_asn: str
-    whois_netname: str
-    whois_raw: str
-
-    # Ports
-    open_ports: List[int]
-
-    # Origin bypass heuristic
-    origin_bypass_http: bool
-    origin_bypass_https: bool
-
-    # TLS
-    tls_cn: str
-    tls_san: List[str]
-    tls_issuer: str
-    tls_not_after: str
-
-    # HTTP headers
-    headers: Dict[str, str]
-    server_hdr: str
-
-    # Edge/WAF/CDN inference
-    cdn_vendor: str
-    waf_vendor: str
-    edge_evidence: str
-
-    # Tools output (optional)
-    wafw00f_summary: str
-    whatweb_summary: str
-
-    # Security posture
-    sec_headers_ok: bool
-
-    # Misc
-    notes: List[str]
-    errors: List[str]
-    debug: Dict[str, Any]
-
-
-# -----------------------------
-# Gemini boot (optional)
-# -----------------------------
-@st.cache_resource
-def boot_gemini():
-    if not GEMINI_OK:
-        return None, None, "google-genai not installed"
-    try:
-        key = st.secrets.get("GEMINI_API_KEY", None)
-        if not key:
-            return None, None, "Missing GEMINI_API_KEY in secrets"
-        client = genai.Client(api_key=key)
-        return client, "gemini-2.0-flash", ""
-    except Exception as e:
-        return None, None, f"Gemini init error: {e!r}"
-
-
-CLIENT, MODEL_ID, GEMINI_BOOT_ERR = boot_gemini()
-
-
-# -----------------------------
-# DNS resolution
-# -----------------------------
-def resolve_dns(domain: str, timeout: float = 3.0) -> Tuple[List[str], List[str], List[str]]:
-    errors: List[str] = []
-    a_records: List[str] = []
-    cname_chain: List[str] = []
-
-    if DNSPYTHON_OK:
+def resolve_dns(domain: str) -> Dict[str, List[str]]:
+    dns = {"A": [], "AAAA": [], "CNAME": [], "MX": [], "NS": [], "TXT": []}
+    for rr in list(dns.keys()):
+        ok, out = run_cmd(["dig", "+short", rr, domain], timeout=5)
+        if ok and out:
+            dns[rr] = [l.strip().rstrip(".") for l in out.splitlines() if l.strip()]
+    if not dns["A"]:
         try:
-            resolver = dns.resolver.Resolver()
-            resolver.lifetime = timeout
-            resolver.timeout = timeout
-
-            cur = domain
-            for _ in range(10):
-                try:
-                    ans = resolver.resolve(cur, "CNAME")
-                    nxt = str(ans[0].target).rstrip(".")
-                    cname_chain.append(nxt)
-                    cur = nxt
-                except Exception:
-                    break
-
-            qname = cname_chain[-1] if cname_chain else domain
-            ans_a = resolver.resolve(qname, "A")
-            for r in ans_a:
-                ip = str(r)
-                try:
-                    ipaddress.ip_address(ip)
-                    a_records.append(ip)
-                except Exception:
-                    pass
-        except Exception as e:
-            errors.append(f"DNS error (dnspython): {e!r}")
-
-    if not a_records:
-        try:
-            infos = socket.getaddrinfo(domain, 80, proto=socket.IPPROTO_TCP)
-            for info in infos:
-                ip = info[4][0]
-                try:
-                    ipaddress.ip_address(ip)
-                    if ip not in a_records:
-                        a_records.append(ip)
-                except Exception:
-                    pass
-        except Exception as e:
-            errors.append(f"DNS error (socket): {e!r}")
-
-    return a_records, cname_chain, errors
-
-
-# -----------------------------
-# WHOIS robust (ipwhois + fallback to whois cmd)
-# -----------------------------
-def parse_whois_text(raw: str) -> Tuple[str, str, str, str]:
-    """
-    Returns: (owner, cidr, asn, netname)
-    Works with ARIN-style output (NetRange/CIDR/NetName/Organization/OrgName/OriginAS)
-    """
-    owner = ""
-    cidr = ""
-    asn = ""
-    netname = ""
-
-    for line in raw.splitlines():
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        k = k.strip().lower()
-        v = v.strip()
-
-        if k in ["orgname", "organization", "org-name", "owner", "custname"]:
-            if not owner:
-                owner = v
-        if k == "netname" and not netname:
-            netname = v
-        if k == "cidr" and not cidr:
-            cidr = v
-        if k in ["originas", "origin", "aut-num"]:
-            if not asn and v:
-                asn = v
-
-    return (
-        first_nonempty(owner),
-        first_nonempty(cidr),
-        asn_norm(asn) if asn else UNKNOWN,
-        first_nonempty(netname),
-    )
-
-
-def ip_whois(ip: str) -> Tuple[str, str, str, str, str]:
-    """
-    Returns: (owner, cidr, asn, netname, raw)
-    """
-    if not ip or ip == UNKNOWN or ip == "N/A":
-        return UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN, ""
-
-    # 1) ipwhois (RDAP)
-    if IPWHOIS_OK:
-        try:
-            obj = IPWhois(ip)
-            rdap = obj.lookup_rdap(depth=1)
-            raw = json.dumps(rdap, ensure_ascii=False)[:20000]
-
-            asn = asn_norm(str(rdap.get("asn", "") or ""))
-            cidr = str(rdap.get("asn_cidr", "") or "") or UNKNOWN
-
-            net = rdap.get("network", {}) or {}
-            netname = str(net.get("name") or net.get("handle") or "") or UNKNOWN
-
-            # Owner: a veces viene mejor en entities; si no, net.name
-            owner = netname
-            return first_nonempty(owner), first_nonempty(cidr), asn, first_nonempty(netname), raw
+            dns["A"] = [socket.gethostbyname(domain)]
         except Exception:
             pass
-
-    # 2) fallback a `whois` del sistema (tu caso)
-    if which("whois"):
-        rc, out, err = run_cmd(["whois", ip], timeout=10)
-        raw = (out or "") + ("\n" + err if err else "")
-        if out.strip():
-            owner, cidr, asn, netname = parse_whois_text(out)
-            return owner, cidr, asn, netname, raw[:40000]
-        return UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN, raw[:40000]
-
-    return UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN, ""
+    return dns
 
 
-# -----------------------------
-# Port scan (concurrent)
-# -----------------------------
-def scan_ports(host: str, ports: List[int], timeout: float = 0.6, max_workers: int = 64) -> List[int]:
-    import concurrent.futures
+def whois_owner(ip: str) -> str:
+    if not ip or ip == "N/A":
+        return "N/A"
+    ok, out = run_cmd(["whois", ip], timeout=8)
+    if not ok or not out:
+        return "N/A"
+    keys = ("org-name", "orgname", "organization", "descr", "netname", "owner")
+    for line in out.splitlines():
+        low = line.lower()
+        if any(k in low for k in keys) and ":" in line:
+            return line.split(":", 1)[1].strip()[:90]
+    return "N/A"
 
+
+def check_port(host: str, port: int, timeout: float = 0.55) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+
+
+def scan_ports(host: str, ports: List[int], workers: int = 64) -> List[int]:
     open_ports: List[int] = []
-
-    def check(p: int) -> Optional[int]:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(timeout)
-                r = s.connect_ex((host, p))
-                return p if r == 0 else None
-        except Exception:
-            return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(check, p) for p in ports]
-        for f in concurrent.futures.as_completed(futs):
-            r = f.result()
-            if r is not None:
-                open_ports.append(r)
-
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(ports)))) as ex:
+        futs = {ex.submit(check_port, host, p): p for p in ports}
+        for fut in as_completed(futs):
+            p = futs[fut]
+            try:
+                if fut.result():
+                    open_ports.append(p)
+            except Exception:
+                pass
     return sorted(open_ports)
 
 
-# -----------------------------
-# TLS details
-# -----------------------------
-def tls_details(domain: str, timeout: float = 5.0) -> Tuple[str, List[str], str, str, List[str]]:
-    errors: List[str] = []
-    cn = UNKNOWN
-    san: List[str] = []
-    issuer = UNKNOWN
-    not_after = UNKNOWN
-
+def tls_not_after(domain: str) -> str:
     try:
         ctx = ssl.create_default_context()
-        with socket.create_connection((domain, 443), timeout=timeout) as sock:
+        with socket.create_connection((domain, 443), timeout=4) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
-
-        subj = parse_cert_subject(cert)
-        cn = subj.get("commonName", UNKNOWN)
-
-        san_tuples = cert.get("subjectAltName", ()) or ()
-        for t in san_tuples:
-            if len(t) == 2 and t[0].lower() == "dns":
-                san.append(str(t[1]))
-
-        issuer_t = cert.get("issuer", ()) or ()
-        issuer_dict: Dict[str, str] = {}
-        for rdn in issuer_t:
-            for k, v in rdn:
-                issuer_dict[str(k)] = str(v)
-        issuer = issuer_dict.get("commonName", UNKNOWN)
-
-        not_after = str(cert.get("notAfter", UNKNOWN))
-    except Exception as e:
-        errors.append(f"TLS error: {e!r}")
-
-    return cn, san[:50], issuer, not_after, errors
+                return cert.get("notAfter", "N/A")
+    except Exception:
+        return "N/A"
 
 
-# -----------------------------
-# Origin bypass checks (heurístico)
-# -----------------------------
-def origin_bypass_checks(sess: requests.Session, domain: str, ip: str, timeout: float) -> Tuple[bool, bool, List[str]]:
-    errors: List[str] = []
-    http_ok = False
-    https_ok = False
+def tls_probe_versions(domain: str) -> Dict[str, str]:
+    if not hasattr(ssl, "TLSVersion"):
+        return {"TLS": "unknown_python_ssl"}
 
-    if not ip or ip in [UNKNOWN, "N/A"]:
-        return False, False, errors
-
-    try:
-        r = safe_get(sess, f"http://{ip}/", timeout=timeout, verify_tls=False, headers={"Host": domain})
-        if r is not None and 200 <= r.status_code < 400:
-            body = (r.text or "")[:4000].lower()
-            if domain.lower() in body or len(body) > 200:
-                http_ok = True
-    except Exception as e:
-        errors.append(f"Origin HTTP bypass check error: {e!r}")
-
-    try:
-        r2 = safe_get(sess, f"https://{ip}/", timeout=timeout, verify_tls=False, headers={"Host": domain})
-        if r2 is not None and 200 <= r2.status_code < 400:
-            body2 = (r2.text or "")[:4000].lower()
-            if domain.lower() in body2 or len(body2) > 200:
-                https_ok = True
-    except Exception as e:
-        errors.append(f"Origin HTTPS bypass check error: {e!r}")
-
-    return http_ok, https_ok, errors
-
-
-# -----------------------------
-# Header aggregation + detection
-# -----------------------------
-def collect_headers_multi(sess: requests.Session, domain: str, verify_tls: bool) -> Tuple[Dict[str, str], List[str], Dict[str, Any]]:
-    """
-    Hace varias requests (HEAD/GET) en endpoints típicos para mejorar señales de CDN/WAF.
-    Retorna: merged_headers, errors, debug
-    """
-    errs: List[str] = []
-    dbg: Dict[str, Any] = {"probes": []}
-    merged: Dict[str, str] = {}
-
-    probes = [
-        ("HEAD", f"https://{domain}/"),
-        ("GET",  f"https://{domain}/"),
-        ("GET",  f"https://{domain}/robots.txt"),
-        ("HEAD", f"http://{domain}/"),
-        ("GET",  f"http://{domain}/"),
+    versions = [
+        ("TLSv1.0", ssl.TLSVersion.TLSv1),
+        ("TLSv1.1", ssl.TLSVersion.TLSv1_1),
+        ("TLSv1.2", ssl.TLSVersion.TLSv1_2),
+        ("TLSv1.3", ssl.TLSVersion.TLSv1_3),
     ]
-
-    for method, url in probes:
+    out: Dict[str, str] = {}
+    for name, v in versions:
         try:
-            if method == "HEAD":
-                r = sess.head(url, timeout=6.5, verify=verify_tls if url.startswith("https://") else False,
-                             headers={"User-Agent": UA_REAL}, allow_redirects=True)
-            else:
-                r = safe_get(sess, url, timeout=6.5, verify_tls=verify_tls if url.startswith("https://") else False)
+            ctx = ssl.create_default_context()
+            ctx.minimum_version = v
+            ctx.maximum_version = v
+            with socket.create_connection((domain, 443), timeout=3) as sock:
+                with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                    _ = ssock.version()
+                    out[name] = "on"
+        except Exception:
+            out[name] = "off"
+    return out
 
-            dbg["probes"].append({"url": url, "status": getattr(r, "status_code", None), "final_url": getattr(r, "url", None)})
-            # Merge headers: preserva el primero que aparezca (más "edge-ish") y completa faltantes
-            for k, v in dict(r.headers).items():
-                if k not in merged:
-                    merged[k] = str(v)
-        except requests.exceptions.SSLError as e:
-            errs.append(f"SSL error {url}: {e!r}")
-            dbg["probes"].append({"url": url, "ssl_error": True})
+
+def http_fetch(domain: str, scheme: str, verify_tls: bool) -> Tuple[Optional[requests.Response], str]:
+    url = f"{scheme}://{domain}"
+    try:
+        r = requests.get(
+            url,
+            timeout=7,
+            headers={"User-Agent": UA},
+            verify=verify_tls,
+            allow_redirects=True,
+        )
+        return r, ""
+    except requests.exceptions.SSLError as e:
+        return None, f"ssl_error={e}"
+    except Exception as e:
+        return None, f"http_error={e}"
+
+
+def headers_audit(h: Dict[str, str]) -> Tuple[int, List[str]]:
+    score = 0
+    findings: List[str] = []
+    for k in SEC_HEADERS:
+        if h.get(k):
+            score += 1
+        else:
+            findings.append(f"MISS {k}")
+    csp = h.get("Content-Security-Policy", "")
+    if csp:
+        if any(x in csp for x in ["unsafe-inline", "unsafe-eval", "*", "data:"]):
+            findings.append("WEAK CSP")
+    return score, findings
+
+
+def detect_cdn_signals(h: Dict[str, str]) -> List[str]:
+    sig = []
+    keys = ["Server", "Via", "X-Cache", "CF-RAY", "CF-Cache-Status", "X-Akamai-Transformed", "X-CDN", "Fastly-FF"]
+    for k in keys:
+        v = h.get(k)
+        if v:
+            sig.append(f"{k}={str(v)[:60]}")
+    return sig
+
+
+def methods_probe(domain: str, verify_tls: bool) -> List[str]:
+    url = f"https://{domain}"
+    try:
+        r = requests.options(url, timeout=6, headers={"User-Agent": UA}, verify=verify_tls, allow_redirects=True)
+        allow = (r.headers.get("Allow", "") or r.headers.get("access-control-allow-methods", "")).upper()
+        if not allow:
+            return []
+        flags = [f"ALLOW={allow[:120]}"]
+        for m in ["TRACE", "TRACK", "PUT", "DELETE"]:
+            if m in allow:
+                flags.append(f"ALLOW {m}")
+        return flags
+    except Exception:
+        return []
+
+
+def rate_limit_probe(domain: str, verify_tls: bool, n: int = 25) -> Dict[str, str]:
+    url = f"https://{domain}/"
+    codes: Dict[str, int] = {}
+    start = time.time()
+    last = None
+    for _ in range(n):
+        try:
+            r = requests.get(url, timeout=5, headers={"User-Agent": UA}, verify=verify_tls, allow_redirects=True)
+            last = r.status_code
+            k = str(r.status_code)
+            codes[k] = codes.get(k, 0) + 1
+            if r.status_code in (429, 403):
+                break
+        except Exception:
+            codes["err"] = codes.get("err", 0) + 1
+            break
+    return {"counts": json.dumps(codes), "elapsed_s": f"{(time.time()-start):.2f}", "last": str(last) if last is not None else "N/A"}
+
+
+def sensitive_paths_probe(domain: str, verify_tls: bool, max_hits: int = 12) -> List[str]:
+    hits: List[str] = []
+    for path in SENSITIVE_PATHS:
+        url = f"https://{domain}{path}"
+        try:
+            r = requests.get(url, timeout=6, headers={"User-Agent": UA}, verify=verify_tls, allow_redirects=False)
+            if r.status_code in (200, 206, 301, 302, 401, 403):
+                hits.append(f"{r.status_code} {path}")
+            if len(hits) >= max_hits:
+                break
+        except Exception:
+            continue
+    return hits
+
+
+def ip_direct_probe(domain: str, ips: List[str]) -> List[str]:
+    findings: List[str] = []
+    for ip in ips[:3]:
+        try:
+            url = f"http://{ip}/"
+            r = requests.get(url, timeout=6, headers={"User-Agent": UA, "Host": domain}, verify=False, allow_redirects=False)
+            srv = (r.headers.get("Server", "N/A") or "N/A")[:40]
+            findings.append(f"IP_DIRECT {ip} {r.status_code} Server={srv}")
+        except Exception:
+            continue
+    return findings
+
+
+def waf_fingerprint(domain: str) -> str:
+    ok, out = run_cmd(["wafw00f", domain], timeout=16)
+    return out if ok and out else f"[{out}]"
+
+
+def whatweb_fingerprint(domain: str) -> str:
+    ok, out = run_cmd(["whatweb", domain], timeout=16)
+    return out if ok and out else f"[{out}]"
+
+
+# -----------------------
+# Snapshot model
+# -----------------------
+@dataclass
+class Snapshot:
+    domain: str
+    dns: Dict[str, List[str]]
+    ip_primary: str
+    owner: str
+    open_ports: List[int]
+    tls_not_after: str
+    tls_versions: Dict[str, str]
+    http_status: str
+    https_status: str
+    headers: Dict[str, str]
+    sec_headers_score: int
+    sec_headers_findings: List[str]
+    cdn_signals: List[str]
+    methods_flags: List[str]
+    rate_limit: Dict[str, str]
+    sensitive_hits: List[str]
+    ip_direct_findings: List[str]
+    wafw00f: str
+    whatweb: str
+
+
+def snapshot_key(s: Snapshot) -> str:
+    payload = json.dumps(asdict(s), sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def build_pdf(snapshot: Snapshot, bullets: List[str]) -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=10)
+
+    pdf.set_font("Arial", "B", 13)
+    pdf.cell(0, 8, f"EdgeSight SE - Light PT :: {snapshot.domain}", ln=True)
+
+    pdf.set_font("Arial", "", 10)
+    pdf.multi_cell(0, 5, f"IP={snapshot.ip_primary} | Owner={snapshot.owner} | Ports={snapshot.open_ports}".encode("latin-1","replace").decode("latin-1"))
+    pdf.multi_cell(0, 5, f"TLS notAfter={snapshot.tls_not_after} | TLS={snapshot.tls_versions}".encode("latin-1","replace").decode("latin-1"))
+
+    pdf.ln(1)
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 6, "Bullets", ln=True)
+    pdf.set_font("Arial", "", 10)
+    for b in bullets[:80]:
+        pdf.multi_cell(0, 5, f"- {b}".encode("latin-1","replace").decode("latin-1"))
+
+    pdf.ln(1)
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 6, "Raw (short)", ln=True)
+    pdf.set_font("Arial", "", 9)
+    pdf.multi_cell(0, 4, f"Headers={snapshot.headers}".encode("latin-1","replace").decode("latin-1"))
+    pdf.multi_cell(0, 4, f"CDN={snapshot.cdn_signals}".encode("latin-1","replace").decode("latin-1"))
+    pdf.multi_cell(0, 4, f"Sensitive={snapshot.sensitive_hits}".encode("latin-1","replace").decode("latin-1"))
+
+    return bytes(pdf.output())
+
+
+# -----------------------
+# Gemini (single call) + retry + cache
+# -----------------------
+@st.cache_resource
+def boot_gemini():
+    if genai is None:
+        return None, None, "genai_sdk_missing"
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", None)
+        if not key:
+            return None, None, "missing_GEMINI_API_KEY"
+        client = genai.Client(api_key=key)
+        return client, "gemini-2.0-flash", ""
+    except Exception as e:
+        return None, None, f"gemini_init_error={e}"
+
+
+CLIENT, MODEL_ID, GEMINI_ERR = boot_gemini()
+
+
+def gemini_generate_with_retry(prompt: str,
+                              max_retries: int = 5,
+                              base_sleep: float = 1.2,
+                              max_sleep: float = 14.0) -> Tuple[bool, str]:
+    if not CLIENT or not MODEL_ID:
+        return False, (GEMINI_ERR or "gemini_unavailable")
+
+    last_err = ""
+    for attempt in range(max_retries + 1):
+        try:
+            res = CLIENT.models.generate_content(model=MODEL_ID, contents=prompt)
+            text = getattr(res, "text", "") or ""
+            return True, text
         except Exception as e:
-            errs.append(f"Fetch error {url}: {e!r}")
-            dbg["probes"].append({"url": url, "error": True})
+            msg = str(e)
+            last_err = msg
+            is_429 = ("429" in msg) or ("RESOURCE_EXHAUSTED" in msg)
+            if not is_429:
+                return False, f"gemini_error={msg}"
 
-    return merged, errs, dbg
+            if attempt >= max_retries:
+                return False, f"gemini_429_exhausted={msg}"
 
+            sleep_s = min(max_sleep, base_sleep * (2 ** attempt)) * (0.7 + random.random() * 0.6)
+            time.sleep(sleep_s)
 
-def analyze_headers(headers: Dict[str, str]) -> Tuple[str, bool]:
-    hl = {k.lower(): str(v) for k, v in (headers or {}).items()}
-    server = (hl.get("server") or UNKNOWN)[:80]
-    sec_headers_ok = ("strict-transport-security" in hl) and ("content-security-policy" in hl)
-    return server, sec_headers_ok
-
-
-def detect_edge_vendor(domain: str, headers: Dict[str, str], cname_chain: List[str], extra_signals: List[str]) -> Tuple[str, str, str]:
-    """
-    Returns: (cdn_vendor, waf_vendor, evidence)
-    Heurístico por señales: headers + CNAME chain + tools output (extra_signals).
-    Si no hay evidencia -> "No detectado".
-    """
-    hl = {k.lower(): str(v) for k, v in (headers or {}).items()}
-    cnames = " ".join([c.lower() for c in (cname_chain or [])])
-
-    evidence: List[str] = []
-    if extra_signals:
-        evidence.extend([f"tool:{s}" for s in extra_signals if s])
-
-    cdn = UNKNOWN
-    waf = UNKNOWN
-
-    def add_ev(tag: str, items: List[str]):
-        for it in items:
-            evidence.append(f"{tag}:{it}")
-
-    # Akamai
-    akamai = []
-    for k in ["x-akamai-request-id", "x-akamai-session-info", "x-akamai-transformed", "akamai-cache-status", "x-check-cacheable", "x-cache"]:
-        if k in hl:
-            akamai.append(k)
-    if "akamai" in (hl.get("via", "") + " " + hl.get("server", "")).lower():
-        akamai.append("server/via contains akamai")
-    if any(x in cnames for x in ["akamai", "edgesuite", "edgekey", "akamaiedge", "akadns", "akamaitechnologies"]):
-        akamai.append("cname akamai pattern")
-    if akamai:
-        cdn = "Akamai (probable)"
-        waf = "Akamai (possible WAAP)"
-        add_ev("akamai", akamai)
-
-    # Cloudflare
-    cf = []
-    for k in ["cf-ray", "cf-cache-status", "cf-request-id", "nel", "report-to"]:
-        if k in hl:
-            cf.append(k)
-    if "cloudflare" in (hl.get("server", "") + " " + cnames).lower():
-        cf.append("server/cname contains cloudflare")
-    if cf and cdn == UNKNOWN:
-        cdn = "Cloudflare (probable)"
-        waf = "Cloudflare WAF (probable)"
-        add_ev("cf", cf)
-
-    # Fastly
-    fastly = []
-    for k in ["x-served-by", "x-cache-hits", "x-timer"]:
-        if k in hl:
-            fastly.append(k)
-    if "fastly" in (hl.get("via", "") + " " + cnames).lower():
-        fastly.append("via/cname contains fastly")
-    if fastly and cdn == UNKNOWN:
-        cdn = "Fastly (probable)"
-        add_ev("fastly", fastly)
-
-    # Imperva
-    imperva = []
-    if "x-iinfo" in hl:
-        imperva.append("x-iinfo")
-    if any(x in cnames for x in ["incapsula", "imperva"]):
-        imperva.append("cname incapsula/imperva")
-    if imperva and waf == UNKNOWN:
-        waf = "Imperva (probable)"
-        add_ev("imperva", imperva)
-
-    # Sucuri
-    sucuri = []
-    if "x-sucuri-id" in hl:
-        sucuri.append("x-sucuri-id")
-    if "sucuri" in hl.get("server", "").lower():
-        sucuri.append("server contains sucuri")
-    if sucuri and waf == UNKNOWN:
-        waf = "Sucuri (probable)"
-        add_ev("sucuri", sucuri)
-
-    ev = " | ".join(evidence)[:320] if evidence else UNKNOWN
-    return cdn, waf, ev
+    return False, f"gemini_error={last_err}"
 
 
-# -----------------------------
-# Tool-based detection (agresivo)
-# -----------------------------
-def wafw00f_aggressive(domain: str) -> str:
-    """
-    Usa wafw00f si está instalado. Si no, devuelve "".
-    Intenta modo más agresivo: --findall y --verbose cuando existen.
-    """
-    if not which("wafw00f"):
-        return ""
-
-    # Intentos por compatibilidad (distintas versiones)
-    candidates = [
-        ["wafw00f", "--findall", "-v", domain],
-        ["wafw00f", "--findall", domain],
-        ["wafw00f", "-v", domain],
-        ["wafw00f", domain],
-    ]
-    for args in candidates:
-        rc, out, err = run_cmd(args, timeout=25)
-        txt = (out or "") + ("\n" + err if err else "")
-        if txt.strip():
-            # Reduce ruido, quedate con líneas relevantes
-            lines = [l.strip() for l in txt.splitlines() if l.strip()]
-            keep = []
-            for l in lines:
-                if any(x in l.lower() for x in ["is behind", "waf", "firewall", "identified", "checking", "site", "detected", "cloudflare", "akamai", "imperva", "sucuri", "f5", "fortinet"]):
-                    keep.append(l)
-            return "\n".join(keep[:30]) if keep else "\n".join(lines[:30])
-    return ""
+@st.cache_data(ttl=900)
+def cached_ai_bullets(model_id: str, snap_key: str, prompt: str) -> List[str]:
+    ok, text = gemini_generate_with_retry(prompt)
+    if not ok:
+        return [f"[INFO] {text[:220]}"]
+    if not text.strip():
+        return ["[INFO] No observado (empty_ai)"]
+    lines = [l.strip("•- \t") for l in text.splitlines() if l.strip()]
+    out = [l[:240] for l in lines if len(l) >= 3]
+    return out[:12] if out else ["[INFO] No observado (unparsed_ai)"]
 
 
-def whatweb_aggressive(domain: str) -> str:
-    """
-    Usa whatweb si está instalado. Nivel agresivo -a 3 (ruidoso).
-    """
-    if not which("whatweb"):
-        return ""
-    args = ["whatweb", "-a", "3", "--no-errors", domain]
-    rc, out, err = run_cmd(args, timeout=25)
-    txt = (out or "") + ("\n" + err if err else "")
-    if not txt.strip():
-        return ""
-    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    return "\n".join(lines[:20])
-
-
-def summarize_tools(wafw00f_out: str, whatweb_out: str) -> Tuple[str, str, List[str]]:
-    """
-    Devuelve: waf_summary, whatweb_summary, extra_signals (strings)
-    """
-    extra: List[str] = []
-    waf_sum = ""
-    ww_sum = ""
-
-    if wafw00f_out.strip():
-        waf_sum = wafw00f_out.strip()[:1200]
-        # señales de vendor
-        low = wafw00f_out.lower()
-        for v in ["akamai", "cloudflare", "imperva", "incapsula", "sucuri", "f5", "fortinet", "aws", "azure", "gcp"]:
-            if v in low:
-                extra.append(f"wafw00f:{v}")
-    if whatweb_out.strip():
-        ww_sum = whatweb_out.strip()[:1200]
-        low = whatweb_out.lower()
-        for v in ["akamai", "cloudflare", "fastly", "imperva", "incapsula", "sucuri"]:
-            if v in low:
-                extra.append(f"whatweb:{v}")
-
-    return waf_sum, ww_sum, extra
-
-
-# -----------------------------
-# Gemini analysis (optional)
-# -----------------------------
-def gemini_analyze(domain: str, infra: InfraData) -> str:
-    if CLIENT is None or MODEL_ID is None:
-        return "Gemini no disponible."
-
-    prompt = f"""
-Rol: Senior Solutions Engineer (Akamai).
-Regla: SOLO usar evidencia provista. Si falta evidencia, marcar como 'No concluyente'.
-
-Dominio: {domain}
-
-Evidencia:
-- DNS A: {infra.a_records}
-- CNAME chain: {infra.cname_chain}
-- IP final: {infra.final_ip}
-- WHOIS: owner={infra.whois_owner}, netname={infra.whois_netname}, cidr={infra.whois_cidr}, asn={infra.whois_asn}
-- TLS: cn={infra.tls_cn}, issuer={infra.tls_issuer}, notAfter={infra.tls_not_after}
-- Headers: server={infra.server_hdr}, sec_headers_ok(HSTS+CSP)={infra.sec_headers_ok}
-- CDN vendor={infra.cdn_vendor}, WAF vendor={infra.waf_vendor}, evidence={infra.edge_evidence}
-- Tools: wafw00f={'present' if infra.wafw00f_summary else 'none'}, whatweb={'present' if infra.whatweb_summary else 'none'}
-- Origin bypass (heurístico): http={infra.origin_bypass_http}, https={infra.origin_bypass_https}
-- Puertos abiertos (connect scan): {infra.open_ports}
+def make_ai_prompt(snapshot: Snapshot) -> str:
+    # Interpretación únicamente: todo viene de outputs ya recolectados
+    return f"""
+Input (no inventar, no suposiciones):
+domain={snapshot.domain}
+dns={snapshot.dns}
+ip_primary={snapshot.ip_primary}
+owner={snapshot.owner}
+open_ports={snapshot.open_ports}
+http_status={snapshot.http_status}
+https_status={snapshot.https_status}
+headers={snapshot.headers}
+sec_headers_score={snapshot.sec_headers_score}
+sec_headers_findings={snapshot.sec_headers_findings}
+tls_not_after={snapshot.tls_not_after}
+tls_versions={snapshot.tls_versions}
+cdn_signals={snapshot.cdn_signals}
+methods_flags={snapshot.methods_flags}
+rate_limit={snapshot.rate_limit}
+sensitive_hits={snapshot.sensitive_hits}
+ip_direct_findings={snapshot.ip_direct_findings}
+wafw00f={snapshot.wafw00f[:600]}
+whatweb={snapshot.whatweb[:600]}
 
 Output:
-5 bullets: (Observación) -> (Riesgo) -> (Acción recomendada). Sin inventar vendors.
-"""
-    try:
-        res = CLIENT.models.generate_content(model=MODEL_ID, contents=prompt)
-        txt = getattr(res, "text", None)
-        return (txt or str(res))[:3000].strip()
-    except Exception as e:
-        return f"Gemini error: {e!r}"
+- 10 bullets técnicos, ultra cortos.
+- Prefijo severidad: [CRIT]/[HIGH]/[MED]/[LOW]/[INFO]
+- No relleno, no marketing.
+- Si evidencia insuficiente: "No observado".
+""".strip()
 
 
-# -----------------------------
-# Main infra collection
-# -----------------------------
-@st.cache_data(show_spinner=False, ttl=600)
-def get_infra_data(domain: str, verify_tls: bool, run_tools: bool) -> InfraData:
-    t0 = time.time()
-    errors: List[str] = []
-    notes: List[str] = []
-    debug: Dict[str, Any] = {"verify_tls": verify_tls, "timing": {}}
+# -----------------------
+# Heuristics bullets (sin AI)
+# -----------------------
+def heuristic_bullets(s: Snapshot) -> List[str]:
+    b: List[str] = []
 
-    # DNS
-    a_records, cname_chain, dns_errs = resolve_dns(domain, timeout=3.0)
-    errors.extend(dns_errs)
-    final_ip = a_records[-1] if a_records else UNKNOWN
+    # Basic
+    if s.ip_primary in ("", "N/A"):
+        b.append("[HIGH] DNS A: No observado")
+    if s.https_status.startswith("ssl_error"):
+        b.append("[HIGH] HTTPS TLS handshake error")
+    if s.sec_headers_score <= 2:
+        b.append(f"[HIGH] SecHeaders score={s.sec_headers_score}/6")
+    elif s.sec_headers_score <= 4:
+        b.append(f"[MED] SecHeaders score={s.sec_headers_score}/6")
+    else:
+        b.append(f"[INFO] SecHeaders score={s.sec_headers_score}/6")
 
-    # WHOIS (consistent)
-    who_owner, who_cidr, who_asn, who_netname, who_raw = ip_whois(final_ip)
-    if who_raw:
-        debug["whois_raw_present"] = True
+    for f in s.sec_headers_findings[:8]:
+        # Missing headers: MED por defecto
+        sev = "[MED]"
+        if "MISS Strict-Transport-Security" in f:
+            sev = "[HIGH]"
+        b.append(f"{sev} {f}")
+
+    # TLS legacy
+    if s.tls_versions.get("TLSv1.0") == "on":
+        b.append("[HIGH] TLSv1.0: ON")
+    if s.tls_versions.get("TLSv1.1") == "on":
+        b.append("[MED] TLSv1.1: ON")
+    if s.tls_versions.get("TLSv1.2") == "off" and s.tls_versions.get("TLSv1.3") == "off":
+        b.append("[CRIT] TLS modern: OFF")
 
     # Ports
-    common_ports = [80, 443, 8080, 8443, 3000, 5000, 8000, 8008, 8888, 9200, 5601, 2082, 2083, 2086, 2087]
-    open_ports = scan_ports(domain, common_ports, timeout=0.6, max_workers=64)
+    exposed = [p for p in s.open_ports if p in RISKY_PORTS]
+    if exposed:
+        b.append(f"[HIGH] Exposed infra ports={exposed}")
+    if 80 in s.open_ports and 443 not in s.open_ports:
+        b.append("[MED] HTTPS: No observado (443 closed)")
 
-    # TLS
-    tls_cn, tls_san, tls_issuer, tls_not_after, tls_errs = tls_details(domain, timeout=5.0)
-    errors.extend(tls_errs)
+    # Sensitive paths
+    if s.sensitive_hits:
+        b.append(f"[HIGH] Sensitive hits={len(s.sensitive_hits)}")
+        for hit in s.sensitive_hits[:10]:
+            # 200 = peor
+            sev = "[HIGH]" if hit.startswith("200") else "[MED]"
+            b.append(f"{sev} {hit}")
 
-    # HTTP headers (multi probes)
-    sess = build_requests_session(total_retries=2, backoff=0.25)
-    headers, hdr_errs, hdr_dbg = collect_headers_multi(sess, domain, verify_tls=verify_tls)
-    errors.extend(hdr_errs)
-    debug["http"] = hdr_dbg
+    # Methods
+    for m in s.methods_flags[:6]:
+        if "ALLOW TRACE" in m or "ALLOW TRACK" in m:
+            b.append(f"[HIGH] {m}")
+        elif "ALLOW PUT" in m or "ALLOW DELETE" in m:
+            b.append(f"[MED] {m}")
+        else:
+            b.append(f"[INFO] {m}")
 
-    server_hdr, sec_headers_ok = analyze_headers(headers)
+    # Rate-limit signals
+    if s.rate_limit:
+        last = s.rate_limit.get("last", "N/A")
+        counts = s.rate_limit.get("counts", "{}")
+        if last in ("429", "403"):
+            b.append(f"[INFO] RateLimit last={last} counts={counts}")
+        else:
+            b.append(f"[LOW] RateLimit last={last} counts={counts}")
 
-    # Tools (wafw00f/whatweb) - “agresivos” pero opcionales
-    wafw00f_out = ""
-    whatweb_out = ""
-    extra_signals: List[str] = []
-    if run_tools:
-        wafw00f_out = wafw00f_aggressive(domain)
-        whatweb_out = whatweb_aggressive(domain)
-        wafw00f_sum, whatweb_sum, extra_signals = summarize_tools(wafw00f_out, whatweb_out)
-    else:
-        wafw00f_sum, whatweb_sum = "", ""
+    # CDN/IP direct
+    if s.cdn_signals:
+        b.append(f"[INFO] CDN signals={len(s.cdn_signals)}")
+        for sig in s.cdn_signals[:5]:
+            b.append(f"[INFO] {sig}")
+    if s.ip_direct_findings:
+        b.append("[MED] IP-direct (Host header) responded")
+        for it in s.ip_direct_findings[:3]:
+            b.append(f"[MED] {it}")
 
-    # Vendor inference (CDN/WAF)
-    cdn_vendor, waf_vendor, edge_evidence = detect_edge_vendor(domain, headers, cname_chain, extra_signals)
+    # Fingerprint presence (not details)
+    if s.wafw00f and "missing_tool" not in s.wafw00f and s.wafw00f != "skip":
+        b.append("[INFO] wafw00f: observed")
+    if s.whatweb and "missing_tool" not in s.whatweb and s.whatweb != "skip":
+        b.append("[INFO] whatweb: observed")
 
-    # Origin bypass heuristic
-    origin_http_bypass, origin_https_bypass, bypass_errs = origin_bypass_checks(sess, domain, final_ip, timeout=4.0)
-    errors.extend(bypass_errs)
+    return b
 
-    if origin_http_bypass or origin_https_bypass:
-        notes.append("Bypass heurístico: respuesta válida desde IP con Host header. Confirmar comparando contenido/headers vs edge.")
-    if final_ip == UNKNOWN:
-        notes.append("Sin A record resoluble: input inválido, DNS roto, o resolución bloqueada.")
-    if cdn_vendor == UNKNOWN and waf_vendor == UNKNOWN:
-        notes.append("Sin señales suficientes para CDN/WAF con probes actuales. Resultado: No detectado.")
 
-    debug["timing"]["total_s"] = round(time.time() - t0, 3)
+# -----------------------
+# Main scan (single pass)
+# -----------------------
+def run_scan(domain: str, ports: List[int], verify_tls: bool, aggressive: bool, workers: int, rl_n: int) -> Snapshot:
+    dns = resolve_dns(domain)
+    ip_primary = (dns.get("A") or ["N/A"])[0]
+    owner = whois_owner(ip_primary) if ip_primary not in ("", "N/A") else "N/A"
 
-    return InfraData(
+    open_ports = scan_ports(domain, ports, workers=workers)
+
+    r_http, e_http = http_fetch(domain, "http", verify_tls=verify_tls)
+    r_https, e_https = http_fetch(domain, "https", verify_tls=verify_tls)
+
+    headers_raw = dict(r_https.headers) if r_https is not None else {}
+    # limit keys (reduce prompt size)
+    headers = {k: str(headers_raw.get(k, ""))[:200] for k in list(headers_raw.keys())[:70]}
+
+    http_status = str(r_http.status_code) if r_http is not None else (e_http or "N/A")
+    https_status = str(r_https.status_code) if r_https is not None else (e_https or "N/A")
+
+    not_after = tls_not_after(domain) if (443 in open_ports or 443 in ports) else "N/A"
+    tls_versions = tls_probe_versions(domain) if (443 in open_ports or 443 in ports) else {"TLS": "N/A"}
+
+    sec_score, sec_findings = headers_audit(headers)
+
+    methods_flags = methods_probe(domain, verify_tls=verify_tls) if aggressive else []
+    rate_limit = rate_limit_probe(domain, verify_tls=verify_tls, n=rl_n) if aggressive else {}
+    sensitive_hits = sensitive_paths_probe(domain, verify_tls=verify_tls) if aggressive else []
+    cdn_signals = detect_cdn_signals(headers)
+    ip_direct_findings = ip_direct_probe(domain, dns.get("A", [])) if aggressive else []
+
+    wafw00f_out = waf_fingerprint(domain) if aggressive else "skip"
+    whatweb_out = whatweb_fingerprint(domain) if aggressive else "skip"
+
+    return Snapshot(
         domain=domain,
-        a_records=a_records,
-        cname_chain=cname_chain,
-        final_ip=final_ip,
-        whois_owner=who_owner,
-        whois_cidr=who_cidr,
-        whois_asn=who_asn,
-        whois_netname=who_netname,
-        whois_raw=who_raw[:40000] if who_raw else "",
+        dns=dns,
+        ip_primary=ip_primary or "N/A",
+        owner=owner,
         open_ports=open_ports,
-        origin_bypass_http=origin_http_bypass,
-        origin_bypass_https=origin_https_bypass,
-        tls_cn=tls_cn,
-        tls_san=tls_san,
-        tls_issuer=tls_issuer,
-        tls_not_after=tls_not_after,
-        headers={k: str(v) for k, v in (headers or {}).items()},
-        server_hdr=server_hdr,
-        cdn_vendor=cdn_vendor,
-        waf_vendor=waf_vendor,
-        edge_evidence=edge_evidence,
-        wafw00f_summary=wafw00f_sum if run_tools else "",
-        whatweb_summary=whatweb_sum if run_tools else "",
-        sec_headers_ok=sec_headers_ok,
-        notes=notes,
-        errors=errors,
-        debug=debug,
+        tls_not_after=not_after,
+        tls_versions=tls_versions,
+        http_status=http_status,
+        https_status=https_status,
+        headers=headers,
+        sec_headers_score=sec_score,
+        sec_headers_findings=sec_findings,
+        cdn_signals=cdn_signals,
+        methods_flags=methods_flags,
+        rate_limit=rate_limit,
+        sensitive_hits=sensitive_hits,
+        ip_direct_findings=ip_direct_findings,
+        wafw00f=wafw00f_out,
+        whatweb=whatweb_out,
     )
 
 
-# -----------------------------
+# -----------------------
 # UI
-# -----------------------------
-st.title("🥷 NinjaZight SE")
+# -----------------------
+st.title("🛡️ EdgeSight SE :: Light PT (Preventa técnico)")
 
-with st.sidebar:
-    st.subheader("Opciones")
-    verify_tls = st.toggle("Verificar TLS", value=True, help="Si el sitio tiene cert inválido, desactiva para no cortar evidencia de headers.")
-    run_tools = st.toggle("Detección agresiva (wafw00f/whatweb)", value=True, help="Usa binarios locales si existen. Si no están, se ignora.")
-    show_debug = st.toggle("Mostrar debug", value=False)
-    st.caption("CDN/WAF es inferencia. Si no hay evidencia: 'No detectado'. WHOIS usa ipwhois si existe; si no, cae a `whois` del sistema.")
+c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+with c1:
+    raw = st.text_input("Dominio", placeholder="empresa.com", label_visibility="collapsed")
+with c2:
+    verify_tls = not st.checkbox("No verificar TLS (inseguro)", value=False)
+with c3:
+    aggressive = st.checkbox("Modo agresivo", value=True)
+with c4:
+    ai_on = st.checkbox("AI bullets", value=True)
 
-target = st.text_input("Dominio o URL:", placeholder="empresa.com / https://empresa.com", label_visibility="collapsed")
-run = st.button("🚀 Iniciar Auditoría Ninja", type="primary")
+with st.expander("Scan profile", expanded=False):
+    ports = st.multiselect("Puertos", TOP100_WEB_INFRA, default=TOP100_WEB_INFRA)
+    workers = st.slider("Concurrencia", 16, 128, 64, 16)
+    rl_n = st.slider("Rate-limit probe (requests)", 10, 60, 25, 5)
 
-if run:
-    dom = normalize_target(target)
-    if not is_valid_domain(dom):
-        st.error("Input inválido. Esperado: dominio FQDN tipo 'empresa.com'.")
+run_btn = st.button("🚀 Run", type="primary")
+
+# session_state: evita reruns rehaciendo y re-llamando AI
+if "last_snapshot" not in st.session_state:
+    st.session_state.last_snapshot = None
+if "last_bullets" not in st.session_state:
+    st.session_state.last_bullets = None
+if "last_snap_key" not in st.session_state:
+    st.session_state.last_snap_key = None
+
+if run_btn:
+    dom = normalize_domain(raw)
+    if not dom:
+        st.error("Dominio inválido (ej: empresa.com)")
         st.stop()
 
-    with st.status("Analizando infraestructura...", expanded=False) as status:
-        infra = get_infra_data(dom, verify_tls=verify_tls, run_tools=run_tools)
-        status.update(label="Análisis de infraestructura completo", state="complete")
+    with st.status("Recon…", expanded=True) as status:
+        status.write("Collect…")
+        snap = run_scan(dom, ports, verify_tls, aggressive, workers, rl_n)
+        status.update(label="Collect done", state="complete", expanded=False)
 
-    # -------------------------
-    # Metrics (4 + 4)
-    # -------------------------
-    c1, c2, c3, c4 = st.columns(4)
+    # Heuristics siempre
+    bullets = heuristic_bullets(snap)
 
-    # WHOIS delta: netname + asn
-    who_delta = f"{infra.whois_netname} | {infra.whois_asn}" if infra.whois_netname != UNKNOWN or infra.whois_asn != UNKNOWN else None
-    c1.metric("IP final (A)", infra.final_ip, who_delta)
-
-    c2.metric("TLS CN", (infra.tls_cn or UNKNOWN)[:28], (infra.tls_not_after or UNKNOWN)[:28])
-
-    bypass_state = "VULNERABLE" if (infra.origin_bypass_http or infra.origin_bypass_https) else "Protegido"
-    c3.metric("Bypass origin", bypass_state, delta="- Riesgo Alto" if bypass_state == "VULNERABLE" else None, delta_color="inverse")
-
-    # Mostrar CIDR como "detalle importante"
-    c4.metric("WHOIS (CIDR)", infra.whois_cidr, infra.whois_owner[:28] if infra.whois_owner != UNKNOWN else None)
-
-    c1b, c2b, c3b, c4b = st.columns(4)
-    c1b.metric("Server header", (infra.server_hdr or UNKNOWN)[:28])
-    c2b.metric("CDN", infra.cdn_vendor)
-    c3b.metric("WAF", infra.waf_vendor)
-    c4b.metric("Security (HSTS+CSP)", "✅ OK" if infra.sec_headers_ok else "❌ Missing")
-
-    st.divider()
-
-    tab_brief, tab_tech = st.tabs(["⚡ Briefing", "🛠️ Técnico"])
-
-    with tab_brief:
-        if CLIENT is not None and MODEL_ID is not None:
-            with st.spinner("Generando briefing con Gemini..."):
-                txt = gemini_analyze(dom, infra)
-            st.info(txt)
+    # AI: single call per snapshot, cached + guarded
+    if ai_on:
+        if CLIENT is None or MODEL_ID is None:
+            bullets = (["[INFO] gemini_unavailable"] if GEMINI_ERR else ["[INFO] gemini_unavailable"]) + bullets
         else:
-            # fallback determinístico
-            bullets = []
-            if infra.cdn_vendor != UNKNOWN or infra.waf_vendor != UNKNOWN:
-                bullets.append(f"CDN/WAF inferido -> {infra.cdn_vendor} / {infra.waf_vendor} -> validar con evidencia (CNAME/headers/tools).")
+            k = snapshot_key(snap)
+            prompt = make_ai_prompt(snap)
+            # cache_data ya evita repeticiones por mismo snap_key
+            ai_bul = cached_ai_bullets(MODEL_ID, k, prompt)
+            bullets = ai_bul + bullets
+
+            # persistir en session_state
+            st.session_state.last_snap_key = k
+    else:
+        st.session_state.last_snap_key = snapshot_key(snap)
+
+    st.session_state.last_snapshot = snap
+    st.session_state.last_bullets = bullets
+
+# Mostrar último resultado (aunque haya rerun)
+snap: Optional[Snapshot] = st.session_state.last_snapshot
+bullets: Optional[List[str]] = st.session_state.last_bullets
+
+if snap and bullets:
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("IP", snap.ip_primary, snap.owner[:22] if snap.owner else "")
+    m2.metric("HTTP", snap.http_status)
+    m3.metric("HTTPS", snap.https_status)
+    m4.metric("Ports open", len(snap.open_ports))
+    m5.metric("SecHeaders", f"{snap.sec_headers_score}/6")
+
+    st.markdown("---")
+    left, right = st.columns([2, 1])
+
+    with left:
+        st.subheader("Alerts / Bullets")
+        for b in bullets[:50]:
+            if b.startswith("[CRIT]") or b.startswith("[HIGH]"):
+                st.error(b)
+            elif b.startswith("[MED]"):
+                st.warning(b)
             else:
-                bullets.append("CDN/WAF -> No detectado -> sin señales suficientes en headers/DNS/tools.")
-            if infra.origin_bypass_http or infra.origin_bypass_https:
-                bullets.append("Origin bypass (heurístico) -> posible exposición -> bloquear acceso directo a origen (ACL/allowlist/mTLS).")
-            if not infra.sec_headers_ok:
-                bullets.append("HSTS/CSP missing -> hardening insuficiente -> definir HSTS y CSP por app.")
-            if any(p in infra.open_ports for p in [8080, 8443, 3000, 5000, 8000, 8888, 9200, 5601]):
-                bullets.append(f"Puertos no estándar {infra.open_ports} -> superficie extra -> restringir por firewall/VPN.")
-            bullets.append(f"WHOIS -> {infra.whois_owner} | {infra.whois_netname} | {infra.whois_cidr} | {infra.whois_asn}")
-            st.info("\n".join([f"- {b}" for b in bullets[:5]]))
+                st.info(b)
 
-        if infra.notes:
-            st.caption("Notas")
-            st.write("\n".join([f"- {n}" for n in infra.notes]))
+    with right:
+        st.subheader("Raw (short)")
+        st.write(f"**DNS A:** `{snap.dns.get('A', [])}`")
+        st.write(f"**DNS AAAA:** `{snap.dns.get('AAAA', [])}`")
+        st.write(f"**CNAME:** `{snap.dns.get('CNAME', [])}`")
+        st.write(f"**MX:** `{snap.dns.get('MX', [])}`")
+        st.write(f"**TLS notAfter:** `{snap.tls_not_after}`")
+        st.write(f"**TLS versions:** `{snap.tls_versions}`")
+        st.write(f"**Open ports:** `{snap.open_ports}`")
+        st.write("**Headers:**")
+        st.json(snap.headers)
 
-        if infra.errors:
-            st.caption("Errores")
-            st.write("\n".join([f"- {e}" for e in infra.errors[:20]]))
+        with st.expander("Fingerprint outputs", expanded=False):
+            st.write("wafw00f")
+            st.code((snap.wafw00f or "N/A")[:2500])
+            st.write("whatweb")
+            st.code((snap.whatweb or "N/A")[:2500])
 
-    with tab_tech:
-        st.write(f"**CNAME chain:** `{infra.cname_chain}`")
-        st.write(f"**A records:** `{infra.a_records}`")
-        st.write(f"**Puertos abiertos:** `{infra.open_ports}`")
+        with st.expander("Snapshot JSON", expanded=False):
+            st.code(json.dumps(asdict(snap), indent=2, default=str)[:12000])
 
-        st.write("**Resumen estructurado:**")
-        st.json(
-            {
-                "domain": infra.domain,
-                "dns": {"a": infra.a_records, "cname_chain": infra.cname_chain, "final_ip": infra.final_ip},
-                "whois": {"owner": infra.whois_owner, "netname": infra.whois_netname, "asn": infra.whois_asn, "cidr": infra.whois_cidr},
-                "tls": {"cn": infra.tls_cn, "san": infra.tls_san[:25], "issuer": infra.tls_issuer, "not_after": infra.tls_not_after},
-                "http": {"server": infra.server_hdr, "sec_headers_ok": infra.sec_headers_ok},
-                "edge": {"cdn_vendor": infra.cdn_vendor, "waf_vendor": infra.waf_vendor, "evidence": infra.edge_evidence},
-                "bypass": {"http": infra.origin_bypass_http, "https": infra.origin_bypass_https},
-            }
-        )
+    st.markdown("---")
+    st.subheader("Export")
+    pdf_bytes = build_pdf(snap, bullets)
+    st.download_button("📥 PDF", data=pdf_bytes, file_name=f"{snap.domain}-lightpt.pdf", mime="application/pdf")
 
-        with st.expander("Evidencia Edge (CDN/WAF)"):
-            st.code(infra.edge_evidence or UNKNOWN)
-
-        with st.expander("Headers crudos"):
-            st.code("\n".join([f"{k}: {v}" for k, v in infra.headers.items()]) or UNKNOWN)
-
-        if infra.wafw00f_summary:
-            with st.expander("wafw00f (agresivo)"):
-                st.code(infra.wafw00f_summary)
-
-        if infra.whatweb_summary:
-            with st.expander("whatweb (-a 3)"):
-                st.code(infra.whatweb_summary)
-
-        if infra.whois_raw:
-            with st.expander("WHOIS crudo"):
-                st.code(infra.whois_raw)
-
-        if show_debug:
-            with st.expander("Debug"):
-                st.json(infra.debug)
+    st.subheader("Next actions (dry)")
+    exposed = [p for p in snap.open_ports if p in RISKY_PORTS]
+    nexts: List[str] = []
+    if snap.sec_headers_score < 5:
+        nexts.append("- Harden security headers (HSTS/CSP/XFO/XCTO/RP/PP)")
+    if snap.tls_versions.get("TLSv1.0") == "on" or snap.tls_versions.get("TLSv1.1") == "on":
+        nexts.append("- Disable legacy TLS (1.0/1.1), enforce modern policies")
+    if exposed:
+        nexts.append(f"- Close/segment exposed infra ports: {exposed}")
+    if snap.ip_direct_findings:
+        nexts.append("- Validate origin protection (ACL/mTLS/auth), prevent CDN bypass")
+    if snap.sensitive_hits:
+        nexts.append("- Remove/protect sensitive endpoints & backups")
+    if not nexts:
+        nexts.append("- Extend: CT subdomains + authz-driven tests (with approval)")
+    st.code("\n".join(nexts))
+else:
+    st.caption("Ready.")
