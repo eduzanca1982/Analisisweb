@@ -11,21 +11,22 @@ st.title("Scan Apukay EZ - Análisis de Infraestructura")
 
 def get_engine_analysis(raw_data):
     try:
-        # Sincronización con el nombre exacto que configuraste en Streamlit Cloud
+        # Recuperación de clave configurada en Secrets
         api_key = st.secrets.get("GEMINI_API_KEY") 
         
         if not api_key:
             return "Error: No se encontró GEMINI_API_KEY en los secretos de Streamlit."
 
+        # Actualización a gemini-2.0-flash para compatibilidad v1beta
         engine = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash", 
+            model="gemini-2.0-flash", 
             google_api_key=api_key, 
             temperature=0
         )
         
         prompt = f"""
-        Analizá el siguiente volcado técnico. 
-        Identificá WAF/CDN, pertenencia de red (WHOIS), y discrepancias de seguridad.
+        Analizá este volcado técnico integral. 
+        Identificá proveedores de WAF/CDN, red de origen (WHOIS), y configuraciones de borde.
         FORMATO: Solo bullets técnicos directos. Sin introducciones.
         
         VOLCADO:
@@ -40,32 +41,32 @@ def run_commands(target):
     audit = {}
     try:
         ip = socket.gethostbyname(target)
-        audit["ip"] = ip
+        audit["resolved_ip"] = ip
         
-        # Wafw00f
+        # Wafw00f: Detección de WAF
         w_proc = subprocess.run(['wafw00f', target, '-v'], capture_output=True, text=True)
         audit["waf_raw"] = w_proc.stdout
         
-        # WhatWeb
+        # WhatWeb: Huella tecnológica y Server Header
         ww_proc = subprocess.run(['whatweb', '-a', '3', target, '--color=never'], capture_output=True, text=True)
         audit["tech_raw"] = ww_proc.stdout
         
-        # WHOIS
+        # WHOIS: Información de red e infraestructura
         whois_proc = subprocess.run(['whois', ip], capture_output=True, text=True)
         audit["whois_raw"] = whois_proc.stdout
     except Exception as e:
-        audit["error"] = str(e)
+        audit["error_ejecucion"] = str(e)
     return audit
 
 target = st.text_input("Target Domain", placeholder="ejemplo.com.py")
 
 if st.button("Ejecutar Análisis") and target:
-    with st.spinner("Procesando..."):
+    with st.spinner("Procesando infraestructura..."):
         data = run_commands(target)
         dump = json.dumps(data, indent=2)
         
         st.subheader("Resultados de Infraestructura")
         st.markdown(get_engine_analysis(dump))
 
-        with st.expander("Ver volcado crudo"):
+        with st.expander("Ver volcado crudo de comandos"):
             st.code(dump, language="json")
