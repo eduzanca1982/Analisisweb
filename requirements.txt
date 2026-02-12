@@ -3,3 +3,9 @@ google-genai
 wafw00f
 fpdf2
 requests
+
+streamlit==1.33.0
+requests==2.31.0
+langchain-core==0.2.36
+langchain-google-genai==1.0.10
+google-generativeai==0.7.2
