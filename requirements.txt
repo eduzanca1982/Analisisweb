@@ -4,3 +4,9 @@ google-generativeai
 requests
 python-whois
 wafw00f
+
+streamlit
+langchain-google-genai
+google-generativeai
+python-whois
+wafw00f
