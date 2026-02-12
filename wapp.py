@@ -1,12 +1,10 @@
 import streamlit as st
 import socket
 import ssl
-import requests
 import datetime
 import subprocess
 import re
 import json
-
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 
@@ -16,156 +14,138 @@ st.title("Scan Apukay EZ - WAF / CDN / TLS / WHOIS")
 API_KEY = st.secrets.get("GOOGLE_API_KEY")
 
 # ===============================
-# NETWORK SNAPSHOT
+# ENGINE DE DETECCIÓN AGRESIVA
 # ===============================
 
-def resolve_ip(host):
+def get_raw_edge_data(host):
+    """Obtiene headers y banners mediante socket para evitar bloqueos de nivel de aplicación."""
     try:
-        return socket.gethostbyname(host)
+        context = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as ssock:
+                # Request minimalista para forzar respuesta de headers
+                request = f"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+                ssock.sendall(request.encode())
+                response = ssock.recv(4096).decode('utf-8', errors='ignore')
+                headers = {}
+                for line in response.split('\r\n')[1:]:
+                    if ": " in line:
+                        k, v = line.split(": ", 1)
+                        headers[k] = v
+                return headers, ssock.version()
     except:
-        return "N/A"
+        return {}, "N/A"
 
-def get_headers(url):
-    try:
-        r = requests.get(url, timeout=10)
-        return dict(r.headers)
-    except:
-        return {}
+def fingerprint_infrastructure(headers):
+    """Detecta proveedores mediante firmas de headers."""
+    h_str = json.dumps(headers).lower()
+    signatures = {
+        "Akamai": ["akamai", "x-akamai", "edge-cache-tag"],
+        "Cloudflare": ["cf-ray", "cloudflare", "__cfduid"],
+        "AWS CloudFront": ["x-amz-cf-", "cloudfront"],
+        "Imperva": ["x-iinfo", "incap-ses", "visid_incap"],
+        "Fastly": ["x-fastly", "fastly"]
+    }
+    found = [name for name, sigs in signatures.items() if any(s in h_str for s in sigs)]
+    return ", ".join(found) if found else "No detectado"
 
-def detect_waf(headers):
-    h = str(headers).lower()
-    if "akamai" in h:
-        return "Akamai"
-    if "cloudflare" in h:
-        return "Cloudflare"
-    if "sucuri" in h:
-        return "Sucuri"
-    if "imperva" in h:
-        return "Imperva"
-    return "No evidente"
-
-def get_tls_info(host):
+def get_tls_details(host):
     try:
         ctx = ssl.create_default_context()
-        with ctx.wrap_socket(socket.socket(), server_hostname=host) as s:
-            s.settimeout(5)
-            s.connect((host, 443))
-            cert = s.getpeercert()
-            not_after = cert['notAfter']
-            expire_date = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-            days_left = (expire_date - datetime.datetime.utcnow()).days
-            return {
-                "issuer": dict(x[0] for x in cert['issuer']).get("organizationName"),
-                "not_after": not_after,
-                "days_left": days_left,
-                "tls_version": s.version()
-            }
+        with socket.create_connection((host, 443), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as s:
+                cert = s.getpeercert()
+                expiry = datetime.datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
+                days_left = (expiry - datetime.datetime.utcnow()).days
+                issuer = dict(x[0] for x in cert['issuer']).get("organizationName")
+                return {"issuer": issuer, "expiry": str(expiry), "days_left": days_left, "version": s.version()}
     except Exception as e:
         return {"error": str(e)}
 
-def whois_ip(ip):
+def deep_whois(ip):
+    """Comando whois agresivo para extraer parámetros de red."""
     try:
-        result = subprocess.run(["whois", ip], capture_output=True, text=True, timeout=8)
-        data = result.stdout
-        org = re.search(r"OrgName:\s*(.*)", data)
-        netname = re.search(r"NetName:\s*(.*)", data)
-        country = re.search(r"Country:\s*(.*)", data)
-        return {
-            "org": org.group(1) if org else None,
-            "netname": netname.group(1) if netname else None,
-            "country": country.group(1) if country else None
+        res = subprocess.run(["whois", ip], capture_output=True, text=True, timeout=10)
+        out = res.stdout
+        patterns = {
+            "Org": r"OrgName|Organization|owner",
+            "NetName": r"NetName|network:name",
+            "Range": r"NetRange|inetnum",
+            "Route": r"route"
         }
+        extracted = {}
+        for key, p in patterns.items():
+            match = re.search(f"({p}):\s*(.*)", out, re.IGNORECASE)
+            extracted[key] = match.group(2).strip() if match else "N/A"
+        return extracted
     except:
-        return {}
+        return {"error": "Whois failed"}
 
 # ===============================
 # IA OBSERVACIONES
 # ===============================
 
 def ai_analysis(snapshot):
-    if not API_KEY:
-        return "No API KEY configurada"
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=API_KEY,
-        temperature=0
-    )
-
+    if not API_KEY: return "Error: No API Key"
+    
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=API_KEY, temperature=0)
+    
     prompt = f"""
-Analiza este snapshot técnico de un sitio web.
-Devuelve SOLO bullets técnicos (sin introducción).
+    Analiza este snapshot técnico. Detecta fallas de seguridad, discrepancias de IP/infraestructura y validez de certificados.
+    FORMATO: Solo bullets técnicos. Sin introducciones.
+    FOCO: Detectar WAF/CDN real, IP de origen probable (si aplica) y riesgos de vencimiento.
 
-Datos:
-{json.dumps(snapshot, indent=2)}
-"""
-
+    DATOS:
+    {json.dumps(snapshot, indent=2)}
+    """
     return llm.invoke([HumanMessage(content=prompt)]).content
 
 # ===============================
-# UI
+# UI STREAMLIT
 # ===============================
 
-target = st.text_input("Target (sin https://)", placeholder="example.com")
+target = st.text_input("Target Domain", placeholder="ejemplo.com")
 
-if st.button("Analizar") and target:
-
-    with st.spinner("Resolviendo..."):
-
-        ip = resolve_ip(target)
-        headers = get_headers(f"https://{target}")
-        waf = detect_waf(headers)
-        tls = get_tls_info(target)
-        whois = whois_ip(ip)
+if st.button("Ejecutar Análisis") and target:
+    with st.spinner("Escaneando Edge..."):
+        ip = socket.gethostbyname(target)
+        headers, tls_ver = get_raw_edge_data(target)
+        infra = fingerprint_infrastructure(headers)
+        tls = get_tls_details(target)
+        net_info = deep_whois(ip)
 
         snapshot = {
-            "host": target,
             "ip": ip,
-            "waf_cdn_detected": waf,
-            "tls": tls,
-            "whois": whois,
+            "detected_infra": infra,
+            "tls_info": tls,
+            "net_whois": net_info,
             "headers": headers
         }
 
-    # ===============================
-    # SNAPSHOT VISUAL SUPERIOR
-    # ===============================
+        # Dashboard de métricas
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("IP Responde", ip)
+        m2.metric("Infraestructura", infra)
+        m3.metric("Días Cert", tls.get("days_left", "N/A"))
+        m4.metric("Protocolo", tls.get("version", "N/A"))
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("IP", ip)
-    c2.metric("WAF/CDN", waf)
-    c3.metric("Cert Days Left", tls.get("days_left") if isinstance(tls, dict) else "N/A")
-    c4.metric("TLS", tls.get("tls_version") if isinstance(tls, dict) else "N/A")
+        st.divider()
 
-    st.divider()
-
-    # ===============================
-    # OUTPUT CRUDO
-    # ===============================
-
-    colA, colB = st.columns(2)
-
-    with colA:
-        st.subheader("TLS / Certificado")
-        st.json(tls)
-
-        st.subheader("WHOIS")
-        st.json(whois)
-
-    with colB:
-        st.subheader("Headers")
-        st.json(headers)
-
-    st.divider()
-
-    # ===============================
-    # IA
-    # ===============================
-
-    st.subheader("Observaciones IA")
-
-    try:
-        bullets = ai_analysis(snapshot)
-        st.markdown(bullets)
-    except Exception as e:
-        st.error(f"Error IA: {e}")
+        # Layout de datos
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.subheader("Network & WHOIS")
+            st.json(net_info)
+            st.subheader("Certificado")
+            st.json(tls)
+        
+        with col_right:
+            st.subheader("IA Technical Insights")
+            try:
+                insights = ai_analysis(snapshot)
+                st.markdown(insights)
+            except Exception as e:
+                st.error(f"Error en IA: {e}")
+            
+            with st.expander("Ver Raw Headers"):
+                st.json(headers)
