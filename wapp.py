@@ -9,25 +9,18 @@ from langchain_core.messages import HumanMessage
 
 st.set_page_config(page_title="Edge Snapshot", layout="wide", initial_sidebar_state="collapsed")
 
-# Custom CSS para estética Dark Tech
+# CSS para priorizar jerarquía visual de infraestructura
 st.markdown("""
     <style>
     [data-testid="stAppViewContainer"] { background-color: #050505; }
     .stMetric { 
-        background-color: #111; 
-        border: 1px solid #333; 
-        padding: 20px; 
-        border-radius: 8px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        background-color: #0d1117; 
+        border: 1px solid #30363d; 
+        padding: 15px; 
+        border-radius: 6px;
     }
-    .status-card {
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 5px solid #00ff41;
-        background-color: #161b22;
-        margin-bottom: 20px;
-    }
-    h1, h2, h3 { color: #e6edf3 !important; font-family: 'Courier New', monospace; }
+    [data-testid="stMetricValue"] { font-size: 1.6rem !important; color: #58a6ff; }
+    .main-header { font-family: 'Courier New', monospace; color: #e6edf3; border-bottom: 2px solid #238636; padding-bottom: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -37,83 +30,75 @@ def get_cert_details(host):
         with socket.create_connection((host, 443), timeout=5) as sock:
             with context.wrap_socket(sock, server_hostname=host) as ssock:
                 cert = ssock.getpeercert()
-                not_after = cert['notAfter']
-                expiry = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                days_left = (expiry - datetime.datetime.utcnow()).days
-                return {"expiry": expiry.strftime("%Y-%m-%d"), "days": days_left, "issuer": dict(x[0] for x in cert['issuer']).get("organizationName")}
-    except:
-        return {"expiry": "N/A", "days": 0, "issuer": "N/A"}
+                expiry = datetime.datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
+                return {
+                    "expiry": expiry.strftime("%Y-%m-%d"),
+                    "days": (expiry - datetime.datetime.utcnow()).days,
+                    "issuer": dict(x[0] for x in cert['issuer']).get("organizationName")
+                }
+    except: return {"expiry": "N/A", "days": 0, "issuer": "N/A"}
 
-def engine_audit(raw_blob):
+def run_analysis_engine(data):
     try:
         api_key = st.secrets.get("GEMINI_API_KEY")
         engine = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
-        
-        prompt = f"""
-        Sos un auditor de infraestructura senior. Analizá el volcado adjunto con foco crítico en:
-        1. Identificación precisa de CDN y WAF (Imperva, Akamai, Cloudflare, etc.).
-        2. Análisis de headers de seguridad ausentes o mal configurados.
-        3. Verificación de propiedad de la red vía WHOIS.
-        
-        FORMATO: Solo bullets técnicos cortos y agresivos.
-        DUMP: {raw_blob}
-        """
+        prompt = f"Auditoría técnica. Identificá WAF/CDN y pertenencia de red (WHOIS). Solo bullets directos:\n{data}"
         return engine.invoke([HumanMessage(content=prompt)]).content
-    except Exception as e:
-        return f"Error en motor: {str(e)}"
+    except Exception as e: return f"Error motor: {str(e)}"
 
-# UI Principal
-st.title("🛡️ SCAN APUKAY EZ")
-st.markdown("### Edge Infrastructure Insights")
+st.markdown("<h1 class='main-header'>🛡️ SCAN APUKAY EZ</h1>", unsafe_allow_html=True)
 
-target = st.text_input("Ingresar Dominio", placeholder="ejemplo.com.py", help="Analizar bordes, certificados y capas de seguridad.")
+target = st.text_input("Target Domain", placeholder="ejemplo.com.py")
 
-if st.button("INICIAR AUDITORÍA") and target:
-    with st.spinner("Escaneando capas de red..."):
-        # Datos Base
+if st.button("INICIAR ESCANEO") and target:
+    with st.spinner("Extrayendo huellas de red..."):
+        # Ejecución técnica
         ip = socket.gethostbyname(target)
-        cert = get_cert_details(target)
-        
-        # Ejecución de comandos de sistema
         w_proc = subprocess.run(['wafw00f', target, '-v'], capture_output=True, text=True)
         ww_proc = subprocess.run(['whatweb', '-a', '3', target, '--color=never'], capture_output=True, text=True)
         whois_proc = subprocess.run(['whois', ip], capture_output=True, text=True)
+        cert = get_cert_details(target)
 
-        # Header de Métricas Rápidas
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("HOST IP", ip)
-        m2.metric("SSL ISSUER", cert['issuer'])
-        m3.metric("EXPIRACIÓN", f"{cert['days']} días", delta=f"{cert['days']}d")
-        m4.metric("FECHA CERT", cert['expiry'])
+        # Extracción de Server de WhatWeb (simplificado)
+        server_match = [line for line in ww_proc.stdout.split(',') if 'Server[' in line]
+        server_label = server_match[0].strip() if server_match else "No detectado"
 
-        st.markdown("---")
+        # FILA 1: INFRAESTRUCTURA DE BORDE (PRIMARIA)
+        st.markdown("### 🌐 Capa de Infraestructura")
+        r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+        
+        # Lógica de detección rápida para UI
+        waf_ui = "Detección pendiente..."
+        if "incapsula" in (w_proc.stdout + whois_proc.stdout).lower(): waf_ui = "Imperva / Incapsula"
+        elif "cloudflare" in (w_proc.stdout + whois_proc.stdout).lower(): waf_ui = "Cloudflare"
+        elif "akamai" in (w_proc.stdout + whois_proc.stdout).lower(): waf_ui = "Akamai"
+        
+        r1_c1.metric("HOST IP", ip)
+        r1_c2.metric("WAF / CDN", waf_ui)
+        r1_c3.metric("WEB SERVER", server_label.replace("Server[", "").replace("]", ""))
+        r1_c4.metric("RED (WHOIS)", "Ver Detalle")
 
-        # Layout Principal: Análisis de Borde
-        col_main, col_side = st.columns([2, 1])
+        # FILA 2: SEGURIDAD Y CERTIFICADOS (SECUNDARIA)
+        st.markdown("### 🔐 Capa de Seguridad")
+        r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
+        r2_c1.metric("SSL EMISOR", cert['issuer'])
+        r2_c2.metric("SSL VENCIMIENTO", cert['expiry'])
+        r2_c3.metric("DÍAS RESTANTES", f"{cert['days']}d")
+        r2_c4.metric("ESTADO", "Válido" if cert['days'] > 0 else "Expirado")
 
-        with col_main:
-            st.markdown("#### 🔍 Análisis de Borde (CDN/WAF)")
-            # Consolidamos datos para la IA
-            audit_dump = {
-                "ip": ip, "cert": cert,
-                "wafw00f": w_proc.stdout,
-                "whatweb": ww_proc.stdout,
-                "whois": whois_proc.stdout
-            }
-            
-            # Resultado del motor técnico
-            analysis = engine_audit(json.dumps(audit_dump))
-            st.info(analysis)
+        st.divider()
 
-        with col_side:
-            st.markdown("#### 📦 Tech Stack & WHOIS")
-            with st.expander("Fingerprint de Servidor"):
-                st.code(ww_proc.stdout, language="text")
-            with st.expander("Registro de Red (WHOIS)"):
-                st.code(whois_proc.stdout, language="text")
-            
-            # Alerta rápida basada en detección de red
-            if "incapsula" in whois_proc.stdout.lower() or "imperva" in whois_proc.stdout.lower():
-                st.success("✅ Estructura protegida por IMPERVA detectada vía Red.")
-            elif "akamai" in whois_proc.stdout.lower():
-                st.success("✅ Estructura protegida por AKAMAI detectada vía Red.")
+        # ÁREA DE ANÁLISIS DINÁMICO
+        c_left, c_right = st.columns([2, 1])
+        
+        with c_left:
+            st.markdown("#### 📜 Análisis de Borde")
+            audit_dump = {"ip": ip, "waf": w_proc.stdout, "tech": ww_proc.stdout, "whois": whois_proc.stdout}
+            st.info(run_analysis_engine(json.dumps(audit_data)))
+
+        with c_right:
+            st.markdown("#### 🛠️ Raw Debug")
+            with st.expander("Detalle WHOIS"):
+                st.code(whois_proc.stdout)
+            with st.expander("Detalle WhatWeb"):
+                st.code(ww_proc.stdout)
